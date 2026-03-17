@@ -185,11 +185,21 @@ namespace Darknet
 			int num_boxes;
 			int train_images_num;
 			float *seq_scales;
-			float *scales;
-			int   *steps;
-			int num_steps;
-			int burn_in;
-			int cudnn_half;
+				float *scales;
+				int   *steps;
+				int num_steps;
+				int burn_in;
+				int tensor_cores_min_iteration;
+				int cudnn_half;
+				int cudnn_bfloat16;
+				int cudnn_fp8;
+				int bf16_master_weights; ///< When set, BF16 weight storage is authoritative instead of the FP32 staging/mirror path
+				Darknet::PrecisionMode precision_mode;
+				int fp8_aggressive;
+				int fp8_requant_interval;
+				int fp8_scale_update_interval;
+				int fp8_debug;
+				int fp8_current_scaling;
 
 			int adam;
 			float B1;
@@ -209,6 +219,7 @@ namespace Darknet
 			int flip; ///< horizontal flip 50% probability augmentaiont for classifier training (default = 1)
 			int gaussian_noise;
 			int blur;
+			int fog;
 			int mixup;
 			float label_smooth_eps;
 			int resize_step;
@@ -287,6 +298,7 @@ namespace Darknet
 		int train;
 		int index;
 		Darknet::Network net;
+		bool input_is_bf16; ///< true when state.input points to BF16 data (prev layer's output_gpu16)
 	};
 
 	char * detection_to_json(Darknet::Detection *dets, int nboxes, int classes, const Darknet::VStr & names, long long int frame_id, char *filename);

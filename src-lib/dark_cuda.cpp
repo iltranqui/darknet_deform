@@ -754,6 +754,16 @@ void show_cuda_cudnn_info()
 #else
 	*cfg_and_state.output << Darknet::in_colour(Darknet::EColour::kBrightWhite, "ENABLED") << std::endl;
 #endif
+#if defined(DARKNET_GPU_CUDA) && (CUDNN_MAJOR >= 8) && (CUDART_VERSION >= 11000)
+	*cfg_and_state.output << "cuDNN BF16 mixed precision is " << Darknet::in_colour(Darknet::EColour::kBrightWhite, "AVAILABLE") << std::endl;
+#else
+	*cfg_and_state.output << "cuDNN BF16 mixed precision is " << Darknet::in_colour(Darknet::EColour::kBrightRed, "UNAVAILABLE") << std::endl;
+#endif
+#if defined(DARKNET_GPU_CUDA) && (CUDNN_MAJOR >= 9) && (CUDART_VERSION >= 12000)
+	*cfg_and_state.output << "cuDNN FP8 mixed precision is " << Darknet::in_colour(Darknet::EColour::kBrightWhite, "AVAILABLE") << std::endl;
+#else
+	*cfg_and_state.output << "cuDNN FP8 mixed precision is " << Darknet::in_colour(Darknet::EColour::kBrightRed, "UNAVAILABLE") << std::endl;
+#endif
 #endif
 
 	if (device_count < 1)

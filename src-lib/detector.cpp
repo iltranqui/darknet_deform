@@ -156,7 +156,7 @@ void prime_training_images_cache(list * image_filenames, const int width, const 
 }
 
 
-void train_detector_internal(const bool break_after_burn_in, std::string & multi_gpu_weights_fn, const char * datacfg, const char * cfgfile, const char * weightfile, int *gpus, int ngpus, int clear, int dont_show, int calc_map, float thresh, float iou_thresh, int show_imgs, int benchmark_layers, const char * chart_path)
+void train_detector_internal(const bool break_after_burn_in, std::string & multi_gpu_weights_fn, const std::string & datacfg, const std::string & cfgfile, const std::string & weightfile, int *gpus, int ngpus, int clear, int dont_show, int calc_map, float thresh, float iou_thresh, int show_imgs, int benchmark_layers, const std::string & chart_path)
 {
 	TAT(TATPARMS);
 
@@ -186,23 +186,24 @@ void train_detector_internal(const bool break_after_burn_in, std::string & multi
 //	const std::filesystem::path & weightfile	= cfg_and_state.weights_filename;
 
 	list *options = read_data_cfg(datacfg);
-	const char *train_images = option_find_str(options, "train", "data/train.txt");
-	const char *valid_images = option_find_str(options, "valid", train_images);
-	const char *backup_directory = option_find_str(options, "backup", "/backup/");
+	const std::string train_images = option_find_str(options, "train", "data/train.txt");
+	const std::string valid_images = option_find_str(options, "valid", train_images);
+	const std::string backup_directory = option_find_str(options, "backup", "/backup/");
 
 	Darknet::Network net_map;
 	if (calc_map)
 	{
-		FILE* valid_file = fopen(valid_images, "r");
+		FILE* valid_file = fopen(valid_images.c_str(), "r");
 		if (!valid_file)
 		{
-			darknet_fatal_error(DARKNET_LOC, "There is no %s file for mAP calculation! Don't use -map flag. Or set valid=%s in %s.", valid_images, train_images, datacfg);
+				darknet_fatal_error(DARKNET_LOC, "There is no %s file for mAP calculation! Don't use -map flag. Or set valid=%s in %s.", valid_images.c_str(), train_images.c_str(), datacfg.c_str());
+
 		}
 		fclose(valid_file);
 
 		cuda_set_device(gpus[0]);
 		*cfg_and_state.output << "Prepare additional network for mAP calculation..." << std::endl;
-		net_map = parse_network_cfg_custom(cfgfile, 1, 1);
+		net_map = parse_network_cfg_custom(cfgfile.c_str(), 1, 1);
 		net_map.benchmark_layers = benchmark_layers;
 
 		// free memory unnecessary arrays
@@ -212,7 +213,7 @@ void train_detector_internal(const bool break_after_burn_in, std::string & multi
 		}
 	}
 
-	const char *base = basecfg(cfgfile);
+	const std::string base = basecfg(cfgfile);
 
 	float avg_loss = -1.0f;
 	float avg_contrastive_acc = 0.0f;
@@ -224,11 +225,11 @@ void train_detector_internal(const bool break_after_burn_in, std::string & multi
 #ifdef DARKNET_GPU
 		cuda_set_device(gpus[k]);
 #endif
-		nets[k] = parse_network_cfg(cfgfile);
+		nets[k] = parse_network_cfg(cfgfile.c_str());
 		nets[k].benchmark_layers = benchmark_layers;
-		if (weightfile)
+		if (!weightfile.empty())
 		{
-			load_weights(&nets[k], weightfile);
+			load_weights(&nets[k], weightfile.c_str());
 		}
 		if (clear)
 		{
@@ -297,11 +298,11 @@ void train_detector_internal(const bool break_after_burn_in, std::string & multi
 
 	int classes = l.classes;
 
-	list *plist = get_paths(train_images);
+	list *plist = get_paths(train_images.c_str());
 	int train_images_num = plist->size;
 	if (train_images_num == 0)
 	{
-		darknet_fatal_error(DARKNET_LOC, "no training images available (verify %s)", train_images);
+		darknet_fatal_error(DARKNET_LOC, "no training images available (verify %s)", train_images.c_str());
 	}
 	if (train_images_num < actual_batch_size)
 	{
@@ -312,6 +313,14 @@ void train_detector_internal(const bool break_after_burn_in, std::string & multi
 
 	const int calc_map_for_each = fmax(100, train_images_num / (net.batch * net.subdivisions));  // calculate mAP for each epoch (used to be every 4 epochs)
 	*cfg_and_state.output << "mAP calculations will be every " << calc_map_for_each << " iterations" << std::endl;
+	if (calc_map)
+	{
+		const int first_map_calc_iteration = fmax(net.burn_in, get_current_iteration(net) + calc_map_for_each);
+		for (int k = 0; k < ngpus; ++k)
+		{
+			nets[k].tensor_cores_min_iteration = first_map_calc_iteration;
+		}
+	}
 
 	// normally we save the weights every 10K, unless max batches is <= 10K in which case we save every 1K
 	int how_often_we_save_weights = (net.max_batches <= 10000 ? 1000 : 10000);
@@ -354,6 +363,7 @@ void train_detector_internal(const bool break_after_burn_in, std::string & multi
 	args.angle = net.angle;
 	args.gaussian_noise = net.gaussian_noise;
 	args.blur = net.blur;
+	args.fog = net.fog;
 	args.mixup = net.mixup;
 	args.exposure = net.exposure;
 	args.saturation = net.saturation;
@@ -592,12 +602,14 @@ void train_detector_internal(const bool break_after_burn_in, std::string & multi
 			}
 		}
 
-		if (cfg_and_state.is_verbose	and
-			net.cudnn_half				and
-			iteration < net.burn_in * 3)
-		{
-			*cfg_and_state.output << "Tensor cores are disabled until iteration #" << (3 * net.burn_in) << "." << std::endl;
-		}
+				const bool bf16_compute_mode = (net.precision_mode == Darknet::PrecisionMode::BF16 || net.precision_mode == Darknet::PrecisionMode::BF16_MASTER_KAHAN || net.precision_mode == Darknet::PrecisionMode::FP8_BF16);
+				const bool tc_warmup_active = (iteration < net.tensor_cores_min_iteration) && (net.loss_scale <= 1.0f);
+				if (cfg_and_state.is_verbose	and
+					bf16_compute_mode and
+					tc_warmup_active)
+				{
+					*cfg_and_state.output << "Tensor cores are disabled until iteration #" << net.tensor_cores_min_iteration << "." << std::endl;
+				}
 
 		const int next_map_calc = fmax(net.burn_in, iter_map + calc_map_for_each);
 
@@ -658,15 +670,14 @@ void train_detector_internal(const bool break_after_burn_in, std::string & multi
 			copy_weights_net(net, &net_map);
 
 			iter_map = iteration;
-			mean_average_precision = validate_detector_map(datacfg, cfgfile, weightfile, thresh, iou_thresh, 0, net.letter_box, &net_map);
+			mean_average_precision = validate_detector_map(datacfg.c_str(), cfgfile.c_str(), weightfile.c_str(), thresh, iou_thresh, 0, net.letter_box, &net_map);
 			if (mean_average_precision >= best_map)
 			{
 				iter_best_map = iteration;
 				best_map = mean_average_precision;
 				*cfg_and_state.output << "New best mAP, saving weights!" << std::endl;
-				char buff[256];
-				sprintf(buff, "%s/%s_best.weights", backup_directory, base);
-				save_weights(net, buff);
+				const std::string best_path = backup_directory + "/" + base + "_best.weights";
+				save_weights(net, best_path.c_str());
 			}
 
 			Darknet::update_accuracy_in_new_charts(-1, mean_average_precision);
@@ -696,9 +707,8 @@ void train_detector_internal(const bool break_after_burn_in, std::string & multi
 #ifdef DARKNET_GPU
 			if (ngpus != 1) sync_nets(nets, ngpus, 0);
 #endif
-			char buff[256];
-			sprintf(buff, "%s/%s_%d.weights", backup_directory, base, iteration);
-			save_weights(net, buff);
+			const std::string periodic_path = backup_directory + "/" + base + "_" + std::to_string(iteration) + ".weights";
+			save_weights(net, periodic_path.c_str());
 		}
 
 		if (iteration >= (iter_save_last + 100) or (iteration % 100 == 0 and iteration > 1))
@@ -707,15 +717,14 @@ void train_detector_internal(const bool break_after_burn_in, std::string & multi
 #ifdef DARKNET_GPU
 			if (ngpus != 1) sync_nets(nets, ngpus, 0);
 #endif
-			char buff[256];
-			sprintf(buff, "%s/%s_last.weights", backup_directory, base);
-			save_weights(net, buff);
+			const std::string last_path = backup_directory + "/" + base + "_last.weights";
+			save_weights(net, last_path.c_str());
 
 			if (net.ema_alpha and is_ema_initialized(net))
 			{
-				sprintf(buff, "%s/%s_ema.weights", backup_directory, base);
-				save_weights_upto(net, buff, net.n, 1);
-				*cfg_and_state.output << "EMA weights are saved to " << buff << std::endl;
+				const std::string ema_path = backup_directory + "/" + base + "_ema.weights";
+				save_weights_upto(net, ema_path.c_str(), net.n, 1);
+				*cfg_and_state.output << "EMA weights are saved to " << ema_path << std::endl;
 			}
 		}
 		Darknet::free_data(train);
@@ -730,9 +739,8 @@ void train_detector_internal(const bool break_after_burn_in, std::string & multi
 			sync_nets(nets, ngpus, 0);
 		}
 #endif
-		char buff[256];
-		sprintf(buff, "%s/%s_final.weights", backup_directory, base);
-		save_weights(net, buff);
+		const std::string final_path = backup_directory + "/" + base + "_final.weights";
+		save_weights(net, final_path.c_str());
 
 		if (mean_average_precision > 0.0f or best_map > 0.0f)
 		{
@@ -767,7 +775,6 @@ void train_detector_internal(const bool break_after_burn_in, std::string & multi
 
 	Darknet::stop_image_loading_threads();
 
-	free((void*)base);
 	free(paths);
 	free_list_contents(plist);
 	free_list(plist);
@@ -791,31 +798,44 @@ void train_detector_internal(const bool break_after_burn_in, std::string & multi
 }
 
 
-void train_detector(const char * datacfg, const char * cfgfile, const char * weightfile, int *gpus, int ngpus, int clear, int dont_show, int calc_map, float thresh, float iou_thresh, int show_imgs, int benchmark_layers, const char * chart_path)
+void train_detector(const std::string & datacfg, const std::string & cfgfile, const std::string & weightfile, int *gpus, int ngpus, int clear, int dont_show, int calc_map, float thresh, float iou_thresh, int show_imgs, int benchmark_layers, const std::string & chart_path)
 {
 	TAT(TATPARMS);
 
-	const char * weights_fn_ptr = nullptr;
-	std::string weights_fn_str;
-	if (weightfile != nullptr)
-	{
-		weights_fn_str = Darknet::trim(weightfile);
-		weights_fn_ptr = weights_fn_str.c_str();
-	}
+	std::string weights_fn_str = Darknet::trim(weightfile);
 
 	// if we have multiple GPUs, then we may need to run on a single GPU for the burn-in period before we enable the rest of the GPUs
 	if (ngpus > 1 and weights_fn_str.empty())
 	{
 		Darknet::display_warning_msg("\nTraining GPUs modified from " + std::to_string(ngpus) + " down to 1 until burn-in.\n\n");
 
-		train_detector_internal(true, weights_fn_str, datacfg, cfgfile, weights_fn_ptr, gpus, 1, clear, dont_show, calc_map, thresh, iou_thresh, show_imgs, benchmark_layers, chart_path);
-		weights_fn_ptr = weights_fn_str.c_str();
+		train_detector_internal(true, weights_fn_str, datacfg, cfgfile, weights_fn_str, gpus, 1, clear, dont_show, calc_map, thresh, iou_thresh, show_imgs, benchmark_layers, chart_path);
 		clear = 0;
 	}
 
-	train_detector_internal(false, weights_fn_str, datacfg, cfgfile, weights_fn_ptr, gpus, ngpus, clear, dont_show, calc_map, thresh, iou_thresh, show_imgs, benchmark_layers, chart_path);
+	train_detector_internal(false, weights_fn_str, datacfg, cfgfile, weights_fn_str, gpus, ngpus, clear, dont_show, calc_map, thresh, iou_thresh, show_imgs, benchmark_layers, chart_path);
 
 	return;
+}
+
+void train_detector(const char * datacfg, const char * cfgfile, const char * weightfile, int *gpus, int ngpus, int clear, int dont_show, int calc_map, float thresh, float iou_thresh, int show_imgs, int benchmark_layers, const char * chart_path)
+{
+	TAT(TATPARMS);
+
+	train_detector(
+		datacfg ? std::string(datacfg) : std::string(),
+		cfgfile ? std::string(cfgfile) : std::string(),
+		weightfile ? std::string(weightfile) : std::string(),
+		gpus,
+		ngpus,
+		clear,
+		dont_show,
+		calc_map,
+		thresh,
+		iou_thresh,
+		show_imgs,
+		benchmark_layers,
+		chart_path ? std::string(chart_path) : std::string());
 }
 
 
@@ -824,8 +844,8 @@ static void print_cocos(FILE *fp, char *image_path, Darknet::Detection * dets, i
 	TAT(TATPARMS);
 
 	int i, j;
-	const char *p = basecfg(image_path);
-	int image_id = atoi(p);
+	const std::string p = basecfg(image_path);
+	int image_id = std::stoi(p);
 	for (i = 0; i < num_boxes; ++i)
 	{
 		float xmin = dets[i].bbox.x - dets[i].bbox.w / 2.;
@@ -847,9 +867,12 @@ static void print_cocos(FILE *fp, char *image_path, Darknet::Detection * dets, i
 		{
 			if (dets[i].prob[j] > 0)
 			{
-				char buff[1024];
-				sprintf(buff, "{\"image_id\":%d, \"category_id\":%d, \"bbox\":[%f, %f, %f, %f], \"score\":%f},\n", image_id, coco_ids[j], bx, by, bw, bh, dets[i].prob[j]);
-				fprintf(fp, "%s", buff);
+				std::ostringstream oss;
+				oss << "{\"image_id\":" << image_id
+					<< ", \"category_id\":" << coco_ids[j]
+					<< ", \"bbox\":[" << bx << ", " << by << ", " << bw << ", " << bh << "]"
+					<< ", \"score\":" << dets[i].prob[j] << "},\n";
+				fprintf(fp, "%s", oss.str().c_str());
 			}
 		}
 	}
@@ -915,10 +938,9 @@ static void print_kitti_detections(FILE **fps, const char *id, Darknet::Detectio
 
 	const char *kitti_ids[] = { "car", "pedestrian", "cyclist" };
 	FILE *fpd = 0;
-	char buffd[1024];
-	snprintf(buffd, 1024, "%s/%s/data/%s.txt", prefix, outfile, id);
+	const std::string filepath = std::string(prefix ? prefix : "") + "/" + (outfile ? outfile : "") + "/data/" + (id ? id : "") + ".txt";
 
-	fpd = fopen(buffd, "w");
+	fpd = fopen(filepath.c_str(), "w");
 	int i, j;
 	for (i = 0; i < total; ++i)
 	{
@@ -1017,22 +1039,22 @@ static void print_bdd_detections(FILE *fp, char *image_path, Darknet::Detection 
 	}
 }
 
-void validate_detector(char *datacfg, char *cfgfile, char *weightfile, const char *outfile)
+void validate_detector(const std::string & datacfg, const std::string & cfgfile, const std::string & weightfile, const std::string & outfile)
 {
 	TAT(TATPARMS);
 
 	int j;
 	list *options = read_data_cfg(datacfg);
-	const char *valid_images = option_find_str(options, "valid", nullptr);
-	const char *prefix = option_find_str(options, "results", "results");
-	const char *mapf = option_find_str(options, "map", 0);
+	const std::string valid_images = option_find_str(options, "valid", "");
+	const std::string prefix = option_find_str(options, "results", "results");
+	const std::string mapf = option_find_str(options, "map", "");
 	int *map = 0;
-	if (mapf) map = read_map(mapf);
+	if (!mapf.empty()) map = read_map(mapf.c_str());
 
-	Darknet::Network net = parse_network_cfg_custom(cfgfile, 1, 1);    // set batch=1
-	if (weightfile)
+	Darknet::Network net = parse_network_cfg_custom(cfgfile.c_str(), 1, 1);    // set batch=1
+	if (!weightfile.empty())
 	{
-		load_weights(&net, weightfile);
+		load_weights(&net, weightfile.c_str());
 	}
 	//set_batch_network(&net, 1);
 	fuse_conv_batchnorm(net);
@@ -1045,7 +1067,7 @@ void validate_detector(char *datacfg, char *cfgfile, char *weightfile, const cha
 
 	Darknet::load_names(&net, option_find_str(options, "names", "unknown.names"));
 
-	list *plist = get_paths(valid_images);
+	list *plist = get_paths(valid_images.c_str());
 	char **paths = (char **)list_to_array(plist);
 
 	Darknet::Layer l = net.layers[net.n - 1];
@@ -1062,8 +1084,7 @@ void validate_detector(char *datacfg, char *cfgfile, char *weightfile, const cha
 	}
 	int classes = l.classes;
 
-	char buff[1024];
-	const char *type = option_find_str(options, "eval", "voc");
+	const std::string type = option_find_str(options, "eval", "voc");
 	FILE *fp = 0;
 	FILE **fps = 0;
 	int coco = 0;
@@ -1071,49 +1092,49 @@ void validate_detector(char *datacfg, char *cfgfile, char *weightfile, const cha
 	int bdd = 0;
 	int kitti = 0;
 
-	if (0 == strcmp(type, "coco"))
+	std::string output_file = outfile;
+	if (type == "coco")
 	{
-		if (!outfile) outfile = "coco_results";
-		snprintf(buff, 1024, "%s/%s.json", prefix, outfile);
-		fp = fopen(buff, "w");
+		if (output_file.empty()) output_file = "coco_results";
+		const std::string filepath = prefix + "/" + output_file + ".json";
+		fp = fopen(filepath.c_str(), "w");
 		fprintf(fp, "[\n");
 		coco = 1;
 	}
-	else if (0 == strcmp(type, "bdd"))
+	else if (type == "bdd")
 	{
-		if (!outfile) outfile = "bdd_results";
-		snprintf(buff, 1024, "%s/%s.json", prefix, outfile);
-		fp = fopen(buff, "w");
+		if (output_file.empty()) output_file = "bdd_results";
+		const std::string filepath = prefix + "/" + output_file + ".json";
+		fp = fopen(filepath.c_str(), "w");
 		fprintf(fp, "[\n");
 		bdd = 1;
 	}
-	else if (0 == strcmp(type, "kitti"))
+	else if (type == "kitti")
 	{
-		char buff2[1024];
-		if (!outfile) outfile = "kitti_results";
-		*cfg_and_state.output << outfile << std::endl;
-		snprintf(buff, 1024, "%s/%s", prefix, outfile);
-		/* int mkd = */ make_directory(buff, 0777);
-		snprintf(buff2, 1024, "%s/%s/data", prefix, outfile);
-		/*int mkd2 = */ make_directory(buff2, 0777);
+		if (output_file.empty()) output_file = "kitti_results";
+		*cfg_and_state.output << output_file << std::endl;
+		const std::string dirpath = prefix + "/" + output_file;
+		make_directory(const_cast<char*>(dirpath.c_str()), 0777);
+		const std::string datapath = prefix + "/" + output_file + "/data";
+		make_directory(const_cast<char*>(datapath.c_str()), 0777);
 		kitti = 1;
 	}
-	else if (0 == strcmp(type, "imagenet"))
+	else if (type == "imagenet")
 	{
-		if (!outfile) outfile = "imagenet-detection";
-		snprintf(buff, 1024, "%s/%s.txt", prefix, outfile);
-		fp = fopen(buff, "w");
+		if (output_file.empty()) output_file = "imagenet-detection";
+		const std::string filepath = prefix + "/" + output_file + ".txt";
+		fp = fopen(filepath.c_str(), "w");
 		imagenet = 1;
 		classes = 200;
 	}
 	else
 	{
-		if (!outfile) outfile = "comp4_det_test_";
+		if (output_file.empty()) output_file = "comp4_det_test_";
 		fps = (FILE**) xcalloc(classes, sizeof(FILE *));
 		for (j = 0; j < classes; ++j)
 		{
-			snprintf(buff, 1024, "%s/%s%s.txt", prefix, outfile, net.details->class_names[j].c_str());
-			fps[j] = fopen(buff, "w");
+			const std::string filepath = prefix + "/" + output_file + net.details->class_names[j] + ".txt";
+			fps[j] = fopen(filepath.c_str(), "w");
 		}
 	}
 
@@ -1171,7 +1192,7 @@ void validate_detector(char *datacfg, char *cfgfile, char *weightfile, const cha
 		for (t = 0; t < nthreads and i + t - nthreads < m; ++t)
 		{
 			char *path = paths[i + t - nthreads];
-			const char *id = basecfg(path);
+			const std::string id = basecfg(path);
 			float *X = val_resized[t].data;
 			network_predict(net, X);
 			int w = val[t].w;
@@ -1204,15 +1225,14 @@ void validate_detector(char *datacfg, char *cfgfile, char *weightfile, const cha
 			}
 			else if (kitti)
 			{
-				print_kitti_detections(fps, id, dets, nboxes, classes, w, h, outfile, prefix);
+				print_kitti_detections(fps, id.c_str(), dets, nboxes, classes, w, h, output_file.c_str(), prefix.c_str());
 			}
 			else
 			{
-				print_detector_detections(fps, id, dets, nboxes, classes, w, h);
+				print_detector_detections(fps, id.c_str(), dets, nboxes, classes, w, h);
 			}
 
 			free_detections(dets, nboxes);
-			free((void*)id);
 			Darknet::free_image(val[t]);
 			Darknet::free_image(val_resized[t]);
 		}
@@ -1256,22 +1276,33 @@ void validate_detector(char *datacfg, char *cfgfile, char *weightfile, const cha
 	*cfg_and_state.output << "Total detection time: " << (time(0) - start) << " seconds" << std::endl;
 }
 
-void validate_detector_recall(char *datacfg, char *cfgfile, char *weightfile)
+void validate_detector(char *datacfg, char *cfgfile, char *weightfile, const char *outfile)
 {
 	TAT(TATPARMS);
 
-	Darknet::Network net = parse_network_cfg_custom(cfgfile, 1, 1);    // set batch=1
-	if (weightfile)
+	validate_detector(
+		datacfg ? std::string(datacfg) : std::string(),
+		cfgfile ? std::string(cfgfile) : std::string(),
+		weightfile ? std::string(weightfile) : std::string(),
+		outfile ? std::string(outfile) : std::string());
+}
+
+void validate_detector_recall(const std::string & datacfg, const std::string & cfgfile, const std::string & weightfile)
+{
+	TAT(TATPARMS);
+
+	Darknet::Network net = parse_network_cfg_custom(cfgfile.c_str(), 1, 1);    // set batch=1
+	if (!weightfile.empty())
 	{
-		load_weights(&net, weightfile);
+		load_weights(&net, weightfile.c_str());
 	}
 	//set_batch_network(&net, 1);
 	fuse_conv_batchnorm(net);
 
 	//list *plist = get_paths("data/coco_val_5k.list");
 	list *options = read_data_cfg(datacfg);
-	const char *valid_images = option_find_str(options, "valid", "data/train.txt");
-	list *plist = get_paths(valid_images);
+	const std::string valid_images = option_find_str(options, "valid", "data/train.txt");
+	list *plist = get_paths(valid_images.c_str());
 	char **paths = (char **)list_to_array(plist);
 
 	//layer l = net.layers[net.n - 1];
@@ -1295,15 +1326,14 @@ void validate_detector_recall(char *datacfg, char *cfgfile, char *weightfile)
 		char *path = paths[i];
 		Darknet::Image orig = Darknet::load_image(path, 0, 0, net.c);
 		Darknet::Image sized = Darknet::resize_image(orig, net.w, net.h);
-		const char *id = basecfg(path);
+		const std::string id = basecfg(path);  // Note: id appears unused but kept for potential future use
 		network_predict(net, sized.data);
 		int nboxes = 0;
 		int letterbox = 0;
 		Darknet::Detection * dets = get_network_boxes(&net, sized.w, sized.h, thresh, .5, 0, 1, &nboxes, letterbox);
 		if (nms) do_nms_obj(dets, nboxes, 1, nms);
 
-		char labelpath[4096];
-		replace_image_to_label(path, labelpath);
+		const std::string labelpath = replace_image_to_label(path);
 
 		int num_labels = 0;
 		box_label *truth = read_boxes(labelpath, &num_labels);
@@ -1340,12 +1370,21 @@ void validate_detector_recall(char *datacfg, char *cfgfile, char *weightfile)
 			<< std::endl;
 
 		free(truth);
-		free((void*)id);
 		Darknet::free_image(orig);
 		Darknet::free_image(sized);
 	}
 }
 
+
+void validate_detector_recall(char *datacfg, char *cfgfile, char *weightfile)
+{
+	TAT(TATPARMS);
+
+	validate_detector_recall(
+		datacfg ? std::string(datacfg) : std::string(),
+		cfgfile ? std::string(cfgfile) : std::string(),
+		weightfile ? std::string(weightfile) : std::string());
+}
 
 typedef struct {
 	float w, h;
@@ -1388,7 +1427,7 @@ int anchors_data_comparator(const float **pa, const float **pb)
 }
 
 
-void calc_anchors(char *datacfg, int num_of_clusters, int width, int height, int show)
+void calc_anchors(const std::string & datacfg, int num_of_clusters, int width, int height, int show)
 {
 	TAT(TATPARMS);
 
@@ -1416,8 +1455,8 @@ void calc_anchors(char *datacfg, int num_of_clusters, int width, int height, int
 	float* rel_width_height_array = (float*)xcalloc(1000, sizeof(float));
 
 	list *options = read_data_cfg(datacfg);
-	const char *train_images = option_find_str(options, "train", "data/train.list");
-	list *plist = get_paths(train_images);
+	const std::string train_images = option_find_str(options, "train", "data/train.list");
+	list *plist = get_paths(train_images.c_str());
 	int number_of_images = plist->size;
 	char **paths = (char **)list_to_array(plist);
 
@@ -1431,8 +1470,7 @@ void calc_anchors(char *datacfg, int num_of_clusters, int width, int height, int
 	for (i = 0; i < number_of_images; ++i)
 	{
 		char *path = paths[i];
-		char labelpath[4096];
-		replace_image_to_label(path, labelpath);
+		const std::string labelpath = replace_image_to_label(path);
 
 		int num_labels = 0;
 		box_label *truth = read_boxes(labelpath, &num_labels);
@@ -1443,7 +1481,7 @@ void calc_anchors(char *datacfg, int num_of_clusters, int width, int height, int
 				truth[j].w > 1 or truth[j].w <= 0 or truth[j].h > 1 or truth[j].h <= 0)
 			{
 				darknet_fatal_error(DARKNET_LOC, "invalid annotation coordinates or size (x=%f, y=%f, w=%f, h=%f) for class #%d in %s line #%d",
-						truth[j].x, truth[j].y, truth[j].w, truth[j].h, truth[j].id, labelpath, j+1);
+						truth[j].x, truth[j].y, truth[j].w, truth[j].h, truth[j].id, labelpath.c_str(), j+1);
 			}
 
 			if (truth[j].id >= classes)
@@ -1524,18 +1562,17 @@ void calc_anchors(char *datacfg, int num_of_clusters, int width, int height, int
 		avg_iou += best_iou;
 	}
 
-	char buff[1024];
 	FILE* fwc = fopen("counters_per_class.txt", "wb");
 	if (fwc)
 	{
-		sprintf(buff, "counters_per_class=");
-		*cfg_and_state.output << buff;
-		fwrite(buff, sizeof(char), strlen(buff), fwc);
+		std::string header = "counters_per_class=";
+		*cfg_and_state.output << header;
+		fwrite(header.c_str(), sizeof(char), header.size(), fwc);
 		for (i = 0; i < classes; ++i)
 		{
-			sprintf(buff, "%d", counter_per_class[i]);
-			*cfg_and_state.output << buff;
-			fwrite(buff, sizeof(char), strlen(buff), fwc);
+			std::string val = std::to_string(counter_per_class[i]);
+			*cfg_and_state.output << val;
+			fwrite(val.c_str(), sizeof(char), val.size(), fwc);
 			if (i < classes - 1)
 			{
 				fwrite(", ", sizeof(char), 2, fwc);
@@ -1564,18 +1601,21 @@ void calc_anchors(char *datacfg, int num_of_clusters, int width, int height, int
 		{
 			float anchor_w = anchors_data.centers.vals[i][0]; //centers->data.fl[i * 2];
 			float anchor_h = anchors_data.centers.vals[i][1]; //centers->data.fl[i * 2 + 1];
+			std::string anchor_str;
 			if (width > 32)
 			{
-				sprintf(buff, "%d, %d", (int)anchor_w, (int)anchor_h);
+				anchor_str = std::to_string((int)anchor_w) + ", " + std::to_string((int)anchor_h);
 			}
 			else
 			{
-				sprintf(buff, "%2.4f,%2.4f", anchor_w, anchor_h);
+				std::ostringstream oss;
+				oss << std::fixed << std::setprecision(4) << anchor_w << "," << anchor_h;
+				anchor_str = oss.str();
 			}
 
-			*cfg_and_state.output << buff;
+			*cfg_and_state.output << anchor_str;
 
-			fwrite(buff, sizeof(char), strlen(buff), fw);
+			fwrite(anchor_str.c_str(), sizeof(char), anchor_str.size(), fw);
 			if (i + 1 < num_of_clusters)
 			{
 				fwrite(", ", sizeof(char), 2, fw);
@@ -1605,12 +1645,12 @@ void test_detector(const char *datacfg, const char *cfgfile, const char *weightf
 	TAT(TATPARMS);
 
 	list *options = read_data_cfg(datacfg);
-
-	Darknet::Network net = parse_network_cfg_custom(cfgfile, 1, 1); // set batch=1
-	if (weightfile)
+	Darknet::Network net = parse_network_cfg_custom(cfgfile, 1, 1);    // set batch=1
+	if (weightfile && weightfile[0] != '\0')
 	{
 		load_weights(&net, weightfile);
 	}
+
 	if (net.letter_box)
 	{
 		letter_box = 1;
@@ -1733,10 +1773,9 @@ void test_detector(const char *datacfg, const char *cfgfile, const char *weightf
 		// pseudo labeling concept - fast.ai
 		if (save_labels)
 		{
-			char labelpath[4096];
-			replace_image_to_label(input, labelpath);
+			const std::string labelpath = replace_image_to_label(input ? input : "");
 
-			FILE* fw = fopen(labelpath, "wb");
+			FILE* fw = fopen(labelpath.c_str(), "wb");
 			for (int i = 0; i < nboxes; ++i)
 			{
 				char tmp[1024];

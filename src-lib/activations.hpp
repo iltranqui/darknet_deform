@@ -33,6 +33,11 @@ void activate_array_normalize_channels_ongpu(float *x, int n, int batch, int cha
 void gradient_array_normalize_channels_ongpu(float *output_gpu, int n, int batch, int channels, int wh_step, float *delta_gpu);
 void activate_array_normalize_channels_softmax_ongpu(float *x, int n, int batch, int channels, int wh_step, float *output_gpu, int use_max_val);
 void gradient_array_normalize_channels_softmax_ongpu(float *output_gpu, int n, int batch, int channels, int wh_step, float *delta_gpu);
+#if defined(DARKNET_GPU_CUDA) && (CUDART_VERSION >= 11000)
+bool can_activate_array_bf16_ongpu(ACTIVATION a);
+void activate_array_bf16_ongpu(float *x_bf16, int n, ACTIVATION a);
+void add_bias_activate_bf16_ongpu(float *output_bf16, float *biases, int batch, int filters, int spatial, ACTIVATION a);
+#endif
 
 #endif
 

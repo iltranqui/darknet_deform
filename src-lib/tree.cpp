@@ -1,4 +1,5 @@
 #include "darknet_internal.hpp"
+#include <sstream>
 
 float Darknet::get_hierarchy_probability(float *x, Darknet::Tree *hier, int c)
 {
@@ -77,24 +78,42 @@ Darknet::Tree * Darknet::read_tree(const char *filename)
 {
 	TAT(TATPARMS);
 
-	Darknet::Tree t = {0};
-	FILE *fp = fopen(filename, "r");
+	return read_tree(filename ? std::string(filename) : std::string());
+}
 
-	char *line;
+Darknet::Tree * Darknet::read_tree(const std::string & filename)
+{
+	TAT(TATPARMS);
+
+	Darknet::Tree t{};
+	FILE *fp = fopen(filename.c_str(), "r");
+
+	std::string line;
 	int last_parent = -1;
 	int group_size = 0;
 	int groups = 0;
 	int n = 0;
-	while((line=fgetl(fp)) != 0){
-		char* id = (char*)xcalloc(256, sizeof(char));
+	while (!(line = fgetl(fp)).empty() || !feof(fp))
+	{
+		if (line.empty())
+		{
+			continue;
+		}
+
+		std::istringstream line_stream(line);
+		std::string id;
 		int parent = -1;
-		sscanf(line, "%s %d", id, &parent);
+		line_stream >> id >> parent;
+		if (id.empty())
+		{
+			continue;
+		}
+
 		t.parent = (int*)xrealloc(t.parent, (n + 1) * sizeof(int));
 		t.parent[n] = parent;
-
-		t.name = (char**)xrealloc(t.name, (n + 1) * sizeof(char*));
-		t.name[n] = id;
-		if(parent != last_parent){
+		t.names.push_back(id);
+		if (parent != last_parent)
+		{
 			++groups;
 			t.group_offset = (int*)xrealloc(t.group_offset, groups * sizeof(int));
 			t.group_offset[groups - 1] = n - group_size;
@@ -117,8 +136,8 @@ Darknet::Tree * Darknet::read_tree(const char *filename)
 	t.groups = groups;
 	t.leaf = (int*)xcalloc(n, sizeof(int));
 	int i;
-	for(i = 0; i < n; ++i) t.leaf[i] = 1;
-	for(i = 0; i < n; ++i) if(t.parent[i] >= 0) t.leaf[t.parent[i]] = 0;
+	for (i = 0; i < n; ++i) t.leaf[i] = 1;
+	for (i = 0; i < n; ++i) if (t.parent[i] >= 0) t.leaf[t.parent[i]] = 0;
 
 	fclose(fp);
 	Darknet::Tree* tree_ptr = (Darknet::Tree*)xcalloc(1, sizeof(Darknet::Tree));

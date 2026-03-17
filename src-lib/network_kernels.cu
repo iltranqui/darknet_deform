@@ -4,6 +4,49 @@
 namespace
 {
 	static auto & cfg_and_state = Darknet::CfgAndState::get();
+
+	static bool layer_can_use_lowp_conv(const Darknet::Network & net, const Darknet::Layer & l, const bool train)
+	{
+		if (l.type != Darknet::ELayerType::CONVOLUTIONAL || l.xnor)
+		{
+			return false;
+		}
+
+		const int iteration_num = get_current_iteration(net);
+		const int tensor_cores_min_iteration = std::max(0, net.tensor_cores_min_iteration);
+		const bool bf16_compute_mode = (
+			net.precision_mode == Darknet::PrecisionMode::BF16 ||
+			net.precision_mode == Darknet::PrecisionMode::BF16_MASTER_KAHAN ||
+			net.precision_mode == Darknet::PrecisionMode::FP8_BF16 ||
+			net.cudnn_bfloat16 || net.cudnn_fp8);
+		const bool allow_bf16_tensor_core_now = (!train || net.loss_scale > 1.0f || iteration_num >= tensor_cores_min_iteration);
+		const bool tc_aligned = ((l.c / std::max(1, l.groups)) % 8 == 0 && l.n % 8 == 0 && l.groups <= 1);
+
+		return (bf16_compute_mode && allow_bf16_tensor_core_now && tc_aligned);
+	}
+
+	static bool layer_can_consume_cached_bf16_input(const Darknet::Network & net, const Darknet::Layer & l, const bool train)
+	{
+		return (layer_can_use_lowp_conv(net, l, train) && !(net.cudnn_fp8 && l.fp8_enabled > 0));
+	}
+
+	static void set_network_state_input_for_next_layer(const Darknet::Network & net, const int index, const bool train, float * & input, bool & input_is_bf16)
+	{
+		const Darknet::Layer & current = net.layers[index];
+		if (index + 1 < net.n)
+		{
+			const Darknet::Layer & next = net.layers[index + 1];
+			if (current.output_gpu16 && layer_can_use_lowp_conv(net, current, train) && layer_can_consume_cached_bf16_input(net, next, train))
+			{
+				input = current.output_gpu16;
+				input_is_bf16 = true;
+				return;
+			}
+		}
+
+		input = current.output_gpu;
+		input_is_bf16 = false;
+	}
 }
 
 
@@ -57,11 +100,11 @@ void forward_network_gpu(Darknet::Network & net, Darknet::NetworkState state)
 
 		l.forward_gpu(l, state);
 
+		set_network_state_input_for_next_layer(net, i, state.train, state.input, state.input_is_bf16);
 		if(net.wait_stream)
 		{
 			CHECK_CUDA(cudaStreamSynchronize(get_cuda_stream()));
 		}
-		state.input = l.output_gpu;
 	}
 
 	if (net.benchmark_layers)
@@ -120,12 +163,22 @@ void backward_network_gpu(Darknet::Network & net, Darknet::NetworkState state)
 		if (i == 0)
 		{
 			state.input = original_input;
+			state.input_is_bf16 = false;
 			state.delta = original_delta;
 		}
 		else
 		{
 			const Darknet::Layer & prev = net.layers[i-1];
-			state.input = prev.output_gpu;
+			if (prev.output_gpu16 && layer_can_use_lowp_conv(net, prev, state.train) && layer_can_consume_cached_bf16_input(net, l, state.train))
+			{
+				state.input = prev.output_gpu16;
+				state.input_is_bf16 = true;
+			}
+			else
+			{
+				state.input = prev.output_gpu;
+				state.input_is_bf16 = false;
+			}
 			state.delta = prev.delta_gpu;
 			if (net.optimized_memory && !prev.keep_delta_gpu)
 			{
@@ -280,23 +333,172 @@ void forward_backward_network_gpu(Darknet::Network & net, float *x, float *y)
 	state.truth = *net.truth_gpu;
 	state.train = 1;
 #if defined(CUDNN_HALF) && defined(CUDNN)
+	const bool use_lowp_weights = (net.cudnn_bfloat16 || net.cudnn_fp8 ||
+		net.precision_mode == Darknet::PrecisionMode::BF16 ||
+		net.precision_mode == Darknet::PrecisionMode::BF16_MASTER_KAHAN ||
+		net.precision_mode == Darknet::PrecisionMode::FP8_BF16);
+	const int current_iteration = get_current_iteration(net);
+	const int fp8_requant_interval = std::max(1, net.fp8_requant_interval);
+	const int fp8_scale_update_interval = std::max(1, net.fp8_scale_update_interval);
+	const int64_t lowp_step = static_cast<int64_t>(current_iteration) * std::max(1, net.subdivisions) + std::max(0, net.current_subdivision);
+#if defined(DARKNET_GPU_CUDA) && (CUDNN_MAJOR >= 9) && (CUDART_VERSION >= 12000)
+	const int fp8_update_scale_now = ((lowp_step % fp8_scale_update_interval) == 0 ? 1 : 0);
+	auto refresh_fp8_if_needed = [&](Darknet::Layer & wl)
+	{
+		const bool tc_aligned = ((wl.c / std::max(1, wl.groups)) % 8 == 0 && wl.n % 8 == 0 && wl.groups <= 1);
+		if (!(net.cudnn_fp8 && wl.fp8_enabled > 0 && tc_aligned))
+		{
+			return false;
+		}
+
+		float *weights_bf16_dst = (net.bf16_master_weights && wl.weights_conv_gpu16) ? wl.weights_conv_gpu16 : wl.weights_gpu16;
+		if (!weights_bf16_dst)
+		{
+			return false;
+		}
+
+		// Weights are updated every training iteration. Keep cache only across subdivisions
+		// inside the same iteration by default. fp8_requant_interval can trade accuracy
+		// for lower quantization overhead by letting the staged weights lag a few steps.
+		if (wl.fp8_weight_cache_iteration < 0 ||
+			(current_iteration - wl.fp8_weight_cache_iteration) >= fp8_requant_interval)
+		{
+			if (net.bf16_master_weights)
+			{
+				cuda_quantize_bf16_to_fp8_bf16_by_policy(
+					wl.weights_gpu16, wl.nweights,
+					wl.weights_fp8_gpu,
+					wl.w_scale_gpu,
+					wl.w_amax_ema_gpu,
+					wl.fp8_format,
+					net.fp8_current_scaling,
+					fp8_update_scale_now,
+					weights_bf16_dst);
+			}
+			else
+			{
+				cuda_quantize_f32_to_fp8_bf16_by_policy(
+					wl.weights_gpu, wl.nweights,
+					wl.weights_fp8_gpu,
+					wl.w_scale_gpu,
+					wl.w_amax_ema_gpu,
+					wl.fp8_format,
+					net.fp8_current_scaling,
+					fp8_update_scale_now,
+					weights_bf16_dst);
+			}
+			wl.fp8_weight_cache_iteration = current_iteration;
+		}
+
+		return true;
+	};
+#endif
 	int i;
 	for (i = 0; i < net.n; ++i)
 	{
 		Darknet::Layer & l = net.layers[i];
-		if (net.cudnn_half)
+		if (use_lowp_weights)
 		{
-			if (l.type == Darknet::ELayerType::CONVOLUTIONAL && l.weights_gpu && l.weights_gpu16)
+			if (l.type == Darknet::ELayerType::CONVOLUTIONAL && l.weights_gpu16 && (net.bf16_master_weights || l.weights_gpu))
 			{
 				assert((l.nweights) > 0);
-				cuda_convert_f32_to_f16(l.weights_gpu, l.nweights, l.weights_gpu16);
+				// BF16 master: weights_gpu16 is already up-to-date (committed after each optimizer step); skip re-derivation.
+#if defined(DARKNET_GPU_CUDA) && (CUDNN_MAJOR >= 9) && (CUDART_VERSION >= 12000)
+				if (refresh_fp8_if_needed(l))
+				{
+					// FP8 path handled.
+				}
+				else if (net.bf16_master_weights)
+				{
+					// nothing to do — weights_gpu16 is the authoritative master
+				}
+				else
+				{
+					if (net.cudnn_bfloat16 || net.cudnn_fp8)	cuda_convert_f32_to_bf16(l.weights_gpu, l.nweights, l.weights_gpu16);
+					else							cuda_convert_f32_to_f16(l.weights_gpu, l.nweights, l.weights_gpu16);
+				}
+#elif defined(DARKNET_GPU_CUDA) && (CUDNN_MAJOR >= 8) && (CUDART_VERSION >= 11000)
+				if (net.bf16_master_weights)
+				{
+					// nothing to do — weights_gpu16 is the authoritative master
+				}
+				else
+				{
+				if (net.cudnn_bfloat16)		cuda_convert_f32_to_bf16(l.weights_gpu, l.nweights, l.weights_gpu16);
+				else							cuda_convert_f32_to_f16(l.weights_gpu, l.nweights, l.weights_gpu16);
+				}
+#else
+				if (!net.bf16_master_weights)
+				{
+					cuda_convert_f32_to_f16(l.weights_gpu, l.nweights, l.weights_gpu16);
+				}
+#endif
 			}
-			else if (l.type == Darknet::ELayerType::CRNN && l.input_layer->weights_gpu && l.input_layer->weights_gpu16)
+			else if (l.type == Darknet::ELayerType::CRNN &&
+				l.input_layer->weights_gpu16 &&
+				l.self_layer->weights_gpu16 &&
+				l.output_layer->weights_gpu16 &&
+				(net.bf16_master_weights || (l.input_layer->weights_gpu && l.self_layer->weights_gpu && l.output_layer->weights_gpu)))
 			{
 				assert((l.input_layer->c*l.input_layer->n*l.input_layer->size*l.input_layer->size) > 0);
-				cuda_convert_f32_to_f16(l.input_layer->weights_gpu, l.input_layer->nweights, l.input_layer->weights_gpu16);
-				cuda_convert_f32_to_f16(l.self_layer->weights_gpu, l.self_layer->nweights, l.self_layer->weights_gpu16);
-				cuda_convert_f32_to_f16(l.output_layer->weights_gpu, l.output_layer->nweights, l.output_layer->weights_gpu16);
+				// BF16 master: sub-layer weights_gpu16 are already authoritative; skip re-derivation.
+		#if defined(DARKNET_GPU_CUDA) && (CUDNN_MAJOR >= 9) && (CUDART_VERSION >= 12000)
+					if (!refresh_fp8_if_needed(*l.input_layer) && !net.bf16_master_weights)
+					{
+						if (net.cudnn_bfloat16 || net.cudnn_fp8)
+						{
+							cuda_convert_f32_to_bf16(l.input_layer->weights_gpu, l.input_layer->nweights, l.input_layer->weights_gpu16);
+						}
+						else
+						{
+							cuda_convert_f32_to_f16(l.input_layer->weights_gpu, l.input_layer->nweights, l.input_layer->weights_gpu16);
+						}
+					}
+
+					if (!refresh_fp8_if_needed(*l.self_layer) && !net.bf16_master_weights)
+					{
+						if (net.cudnn_bfloat16 || net.cudnn_fp8)
+						{
+							cuda_convert_f32_to_bf16(l.self_layer->weights_gpu, l.self_layer->nweights, l.self_layer->weights_gpu16);
+						}
+						else
+						{
+							cuda_convert_f32_to_f16(l.self_layer->weights_gpu, l.self_layer->nweights, l.self_layer->weights_gpu16);
+						}
+					}
+
+					if (!refresh_fp8_if_needed(*l.output_layer) && !net.bf16_master_weights)
+					{
+						if (net.cudnn_bfloat16 || net.cudnn_fp8)
+						{
+							cuda_convert_f32_to_bf16(l.output_layer->weights_gpu, l.output_layer->nweights, l.output_layer->weights_gpu16);
+						}
+						else
+						{
+							cuda_convert_f32_to_f16(l.output_layer->weights_gpu, l.output_layer->nweights, l.output_layer->weights_gpu16);
+						}
+					}
+#elif defined(DARKNET_GPU_CUDA) && (CUDNN_MAJOR >= 8) && (CUDART_VERSION >= 11000)
+				if (!net.bf16_master_weights && net.cudnn_bfloat16)
+				{
+					cuda_convert_f32_to_bf16(l.input_layer->weights_gpu, l.input_layer->nweights, l.input_layer->weights_gpu16);
+					cuda_convert_f32_to_bf16(l.self_layer->weights_gpu, l.self_layer->nweights, l.self_layer->weights_gpu16);
+					cuda_convert_f32_to_bf16(l.output_layer->weights_gpu, l.output_layer->nweights, l.output_layer->weights_gpu16);
+				}
+				else if (!net.bf16_master_weights)
+				{
+					cuda_convert_f32_to_f16(l.input_layer->weights_gpu, l.input_layer->nweights, l.input_layer->weights_gpu16);
+					cuda_convert_f32_to_f16(l.self_layer->weights_gpu, l.self_layer->nweights, l.self_layer->weights_gpu16);
+					cuda_convert_f32_to_f16(l.output_layer->weights_gpu, l.output_layer->nweights, l.output_layer->weights_gpu16);
+				}
+#else
+				if (!net.bf16_master_weights)
+				{
+					cuda_convert_f32_to_f16(l.input_layer->weights_gpu, l.input_layer->nweights, l.input_layer->weights_gpu16);
+					cuda_convert_f32_to_f16(l.self_layer->weights_gpu, l.self_layer->nweights, l.self_layer->weights_gpu16);
+					cuda_convert_f32_to_f16(l.output_layer->weights_gpu, l.output_layer->nweights, l.output_layer->weights_gpu16);
+				}
+#endif
 			}
 		}
 	}
@@ -467,7 +669,19 @@ void pull_weights(Darknet::Layer & l)
 	if (l.type == Darknet::ELayerType::CONVOLUTIONAL)
 	{
 		cuda_pull_array(l.biases_gpu, l.biases, l.n);
-		cuda_pull_array(l.weights_gpu, l.weights, l.nweights);
+#if defined(DARKNET_GPU_CUDA) && (CUDART_VERSION >= 11000)
+		if (cfg_and_state.use_bf16_master_weights && l.weights_gpu16)
+		{
+			float *weights_gpu_tmp = cuda_make_array(NULL, l.nweights);
+			cuda_convert_bf16_to_f32(l.weights_gpu16, l.nweights, weights_gpu_tmp);
+			cuda_pull_array(weights_gpu_tmp, l.weights, l.nweights);
+			cuda_free(weights_gpu_tmp);
+		}
+		else
+#endif
+		{
+			cuda_pull_array(l.weights_gpu, l.weights, l.nweights);
+		}
 		if (l.scales)
 		{
 			cuda_pull_array(l.scales_gpu, l.scales, l.n);
@@ -487,7 +701,22 @@ void push_weights(Darknet::Layer & l)
 	if(l.type == Darknet::ELayerType::CONVOLUTIONAL)
 	{
 		cuda_push_array(l.biases_gpu, l.biases, l.n);
-		cuda_push_array(l.weights_gpu, l.weights, l.nweights);
+#if defined(DARKNET_GPU_CUDA) && (CUDART_VERSION >= 11000)
+		if (cfg_and_state.use_bf16_master_weights && l.weights_gpu16)
+		{
+			float *weights_gpu_tmp = cuda_make_array(l.weights, l.nweights);
+			cuda_convert_f32_to_bf16(weights_gpu_tmp, l.nweights, l.weights_gpu16);
+			cuda_free(weights_gpu_tmp);
+			if (l.weight_compensation_gpu)
+			{
+				CHECK_CUDA(cudaMemsetAsync(l.weight_compensation_gpu, 0, sizeof(float) * (l.nweights / 2 + 1), get_cuda_stream()));
+			}
+		}
+		else
+#endif
+		{
+			cuda_push_array(l.weights_gpu, l.weights, l.nweights);
+		}
 		if(l.scales)
 		{
 			cuda_push_array(l.scales_gpu, l.scales, l.n);
@@ -506,9 +735,10 @@ void distribute_weights(Darknet::Layer & l, Darknet::Layer & base)
 
 	if(l.type == Darknet::ELayerType::CONVOLUTIONAL)
 	{
-		cuda_push_array(l.biases_gpu, base.biases, l.n);
-		cuda_push_array(l.weights_gpu, base.weights, l.nweights);
-		if(base.scales) cuda_push_array(l.scales_gpu, base.scales, l.n);
+		copy_cpu(l.n, base.biases, 1, l.biases, 1);
+		copy_cpu(l.nweights, base.weights, 1, l.weights, 1);
+		if (base.scales) copy_cpu(l.n, base.scales, 1, l.scales, 1);
+		push_weights(l);
 	}
 	else if(l.type == Darknet::ELayerType::CONNECTED)
 	{

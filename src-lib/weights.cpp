@@ -1,9 +1,135 @@
 #include "option_list.hpp"
 #include "darknet_internal.hpp"
 
+#include <algorithm>
+#include <cctype>
+#include <cstdint>
+#include <cstring>
+#include <tuple>
+#include <vector>
+
 namespace
 {
 	static auto & cfg_and_state = Darknet::CfgAndState::get();
+
+	constexpr uint32_t k_bf16_weights_magic = 0x36314642u; // "BF16"
+	constexpr uint32_t k_bf16_weights_version = 1u;
+
+	static inline bool has_suffix_ci(const std::string & text, const std::string & suffix)
+	{
+		if (suffix.size() > text.size())
+		{
+			return false;
+		}
+
+		for (size_t i = 0; i < suffix.size(); ++i)
+		{
+			const char a = std::tolower(static_cast<unsigned char>(text[text.size() - suffix.size() + i]));
+			const char b = std::tolower(static_cast<unsigned char>(suffix[i]));
+			if (a != b)
+			{
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	static inline bool should_save_bf16_weights(const char *filename)
+	{
+		if (cfg_and_state.is_set("savebf16") || cfg_and_state.is_set("savebf16weights") ||
+			cfg_and_state.is_set("save_bf16") || cfg_and_state.is_set("save_bf16_weights"))
+		{
+			return true;
+		}
+
+		if (filename == nullptr)
+		{
+			return false;
+		}
+
+		const std::string fn = filename;
+		return has_suffix_ci(fn, ".bf16") || has_suffix_ci(fn, ".bf16.weights") || has_suffix_ci(fn, ".weights.bf16");
+	}
+
+	static inline uint16_t fp32_to_bf16_bits(const float x)
+	{
+		uint32_t bits = 0;
+		std::memcpy(&bits, &x, sizeof(bits));
+		const uint32_t lsb = (bits >> 16u) & 1u;
+		bits += 0x7FFFu + lsb; // round-to-nearest-even
+		return static_cast<uint16_t>(bits >> 16u);
+	}
+
+	static inline float bf16_bits_to_fp32(const uint16_t x)
+	{
+		const uint32_t bits = static_cast<uint32_t>(x) << 16u;
+		float out = 0.0f;
+		std::memcpy(&out, &bits, sizeof(out));
+		return out;
+	}
+
+	static size_t fwrite_bf16_from_f32(const float *src, const size_t count, std::FILE *fp)
+	{
+		if (src == nullptr)
+		{
+			darknet_fatal_error(DARKNET_LOC, "attempting to write BF16 weights from a NULL pointer");
+		}
+		if (count == 0)
+		{
+			return 0;
+		}
+
+		std::vector<uint16_t> tmp(count);
+		for (size_t i = 0; i < count; ++i)
+		{
+			tmp[i] = fp32_to_bf16_bits(src[i]);
+		}
+
+		const auto written = std::fwrite(tmp.data(), sizeof(uint16_t), count, fp);
+		if (written != count)
+		{
+			darknet_fatal_error(DARKNET_LOC, "failed to write BF16 values to weights file (%lu of %lu items)", written, count);
+		}
+
+		return count * sizeof(uint16_t);
+	}
+
+	static size_t xfread_bf16_to_f32(float *dst, const size_t count, std::FILE *fp, const std::string & description = "")
+	{
+		if (dst == nullptr)
+		{
+			darknet_fatal_error(DARKNET_LOC, "attempting to load BF16 %lu %s, but destination pointer is NULL", count, description.c_str());
+		}
+		if (count == 0)
+		{
+			return 0;
+		}
+
+		std::vector<uint16_t> tmp(count);
+		const auto items_read = std::fread(tmp.data(), sizeof(uint16_t), count, fp);
+		if (items_read != count)
+		{
+			Darknet::display_warning_msg(
+				"The BF16 .weights file does not match the .cfg file (not enough fields to read in the weights).\n"
+				"Normally this means the .weights file was corrupted, or you've mixed up which .cfg file goes with which .weights file.\n"
+				"Another common problem is if you edit your .names file or .cfg file and you forget to re-train your network.\n");
+
+			darknet_fatal_error(DARKNET_LOC, "expected to read %lu BF16 fields, but only read %lu", count, items_read);
+		}
+
+		for (size_t i = 0; i < count; ++i)
+		{
+			dst[i] = bf16_bits_to_fp32(tmp[i]);
+		}
+
+		if (cfg_and_state.is_trace)
+		{
+			*cfg_and_state.output << "-> read " << count << " x BF16 values (" << Darknet::size_to_IEC_string(sizeof(uint16_t) * count) << ")" << (description.empty() ? "" : " as " + description) << std::endl;
+		}
+
+		return sizeof(uint16_t) * count;
+	}
 
 
 	/// @returns the total number of bytes read
@@ -136,6 +262,21 @@ void save_shortcut_weights(Darknet::Layer & l, FILE *fp)
 	fwrite(l.weights, sizeof(float), num, fp);
 }
 
+void save_shortcut_weights_bf16(Darknet::Layer & l, FILE *fp)
+{
+	TAT(TATPARMS);
+
+#ifdef DARKNET_GPU
+	if (cfg_and_state.gpu_index >= 0)
+	{
+		pull_shortcut_layer(l);
+	}
+#endif
+
+	const int num = l.nweights;
+	std::ignore = fwrite_bf16_from_f32(l.weights, num, fp);
+}
+
 void save_convolutional_weights(Darknet::Layer & l, FILE *fp)
 {
 	TAT(TATPARMS);
@@ -166,6 +307,32 @@ void save_convolutional_weights(Darknet::Layer & l, FILE *fp)
 	//}
 }
 
+void save_convolutional_weights_bf16(Darknet::Layer & l, FILE *fp)
+{
+	TAT(TATPARMS);
+
+	if (l.binary)
+	{
+		//save_convolutional_weights_binary(l, fp);
+		//return;
+	}
+#ifdef DARKNET_GPU
+	if (cfg_and_state.gpu_index >= 0)
+	{
+		pull_convolutional_layer(l);
+	}
+#endif
+	const int num = l.nweights;
+	std::ignore = fwrite_bf16_from_f32(l.biases, l.n, fp);
+	if (l.batch_normalize)
+	{
+		std::ignore = fwrite_bf16_from_f32(l.scales, l.n, fp);
+		std::ignore = fwrite_bf16_from_f32(l.rolling_mean, l.n, fp);
+		std::ignore = fwrite_bf16_from_f32(l.rolling_variance, l.n, fp);
+	}
+	std::ignore = fwrite_bf16_from_f32(l.weights, num, fp);
+}
+
 void save_convolutional_weights_ema(Darknet::Layer & l, FILE *fp)
 {
 	TAT(TATPARMS);
@@ -194,6 +361,32 @@ void save_convolutional_weights_ema(Darknet::Layer & l, FILE *fp)
 	//    fwrite(l.m, sizeof(float), num, fp);
 	//    fwrite(l.v, sizeof(float), num, fp);
 	//}
+}
+
+void save_convolutional_weights_ema_bf16(Darknet::Layer & l, FILE *fp)
+{
+	TAT(TATPARMS);
+
+	if (l.binary)
+	{
+		//save_convolutional_weights_binary(l, fp);
+		//return;
+	}
+#ifdef DARKNET_GPU
+	if (cfg_and_state.gpu_index >= 0)
+	{
+		pull_convolutional_layer(l);
+	}
+#endif
+	const int num = l.nweights;
+	std::ignore = fwrite_bf16_from_f32(l.biases_ema, l.n, fp);
+	if (l.batch_normalize)
+	{
+		std::ignore = fwrite_bf16_from_f32(l.scales_ema, l.n, fp);
+		std::ignore = fwrite_bf16_from_f32(l.rolling_mean, l.n, fp);
+		std::ignore = fwrite_bf16_from_f32(l.rolling_variance, l.n, fp);
+	}
+	std::ignore = fwrite_bf16_from_f32(l.weights_ema, num, fp);
 }
 
 void save_batchnorm_weights(Darknet::Layer & l, FILE *fp)
@@ -232,6 +425,26 @@ void save_connected_weights(Darknet::Layer & l, FILE *fp)
 	}
 }
 
+void save_connected_weights_bf16(Darknet::Layer & l, FILE *fp)
+{
+	TAT(TATPARMS);
+
+#ifdef DARKNET_GPU
+	if (cfg_and_state.gpu_index >= 0)
+	{
+		pull_connected_layer(l);
+	}
+#endif
+	std::ignore = fwrite_bf16_from_f32(l.biases, l.outputs, fp);
+	std::ignore = fwrite_bf16_from_f32(l.weights, l.outputs * l.inputs, fp);
+	if (l.batch_normalize)
+	{
+		std::ignore = fwrite_bf16_from_f32(l.scales, l.outputs, fp);
+		std::ignore = fwrite_bf16_from_f32(l.rolling_mean, l.outputs, fp);
+		std::ignore = fwrite_bf16_from_f32(l.rolling_variance, l.outputs, fp);
+	}
+}
+
 void save_weights_upto(const Darknet::Network & net, const char *filename, int cutoff, int save_ema)
 {
 	TAT(TATPARMS);
@@ -243,7 +456,8 @@ void save_weights_upto(const Darknet::Network & net, const char *filename, int c
 	}
 #endif
 
-	*cfg_and_state.output << "Saving weights to " << Darknet::in_colour(Darknet::EColour::kBrightMagenta, filename) << std::endl;
+	const bool save_bf16 = should_save_bf16_weights(filename);
+	*cfg_and_state.output << "Saving weights to " << Darknet::in_colour(Darknet::EColour::kBrightMagenta, filename) << (save_bf16 ? " (BF16 format)" : "") << std::endl;
 
 	FILE *fp = fopen(filename, "wb");
 	if (not fp)
@@ -255,11 +469,23 @@ void save_weights_upto(const Darknet::Network & net, const char *filename, int c
 	const int minor = DARKNET_WEIGHTS_VERSION_MINOR;
 	const int revision = DARKNET_WEIGHTS_VERSION_PATCH;
 
-	fwrite(&major, sizeof(int), 1, fp);
-	fwrite(&minor, sizeof(int), 1, fp);
-	fwrite(&revision, sizeof(int), 1, fp);
 	(*net.seen) = get_current_iteration(net) * net.batch * net.subdivisions; // remove this line, when you will save to weights-file both: seen & cur_iteration
-	fwrite(net.seen, sizeof(uint64_t), 1, fp);
+	if (save_bf16)
+	{
+		fwrite(&k_bf16_weights_magic, sizeof(uint32_t), 1, fp);
+		fwrite(&k_bf16_weights_version, sizeof(uint32_t), 1, fp);
+		fwrite(&major, sizeof(int), 1, fp);
+		fwrite(&minor, sizeof(int), 1, fp);
+		fwrite(&revision, sizeof(int), 1, fp);
+		fwrite(net.seen, sizeof(uint64_t), 1, fp);
+	}
+	else
+	{
+		fwrite(&major, sizeof(int), 1, fp);
+		fwrite(&minor, sizeof(int), 1, fp);
+		fwrite(&revision, sizeof(int), 1, fp);
+		fwrite(net.seen, sizeof(uint64_t), 1, fp);
+	}
 
 	for (int i = 0; i < net.n && i < cutoff; ++i)
 	{
@@ -268,43 +494,79 @@ void save_weights_upto(const Darknet::Network & net, const char *filename, int c
 		{
 			if (save_ema)
 			{
-				save_convolutional_weights_ema(l, fp);
+				if (save_bf16) save_convolutional_weights_ema_bf16(l, fp);
+				else save_convolutional_weights_ema(l, fp);
 			}
 			else
 			{
-				save_convolutional_weights(l, fp);
+				if (save_bf16) save_convolutional_weights_bf16(l, fp);
+				else save_convolutional_weights(l, fp);
 			}
 		}
 		if (l.type == Darknet::ELayerType::SHORTCUT && l.nweights > 0)
 		{
-			save_shortcut_weights(l, fp);
+			if (save_bf16) save_shortcut_weights_bf16(l, fp);
+			else save_shortcut_weights(l, fp);
 		}
 		if (l.type == Darknet::ELayerType::CONNECTED)
 		{
-			save_connected_weights(l, fp);
+			if (save_bf16) save_connected_weights_bf16(l, fp);
+			else save_connected_weights(l, fp);
 		}
 		if (l.type == Darknet::ELayerType::RNN)
 		{
-			save_connected_weights(*(l.input_layer), fp);
-			save_connected_weights(*(l.self_layer), fp);
-			save_connected_weights(*(l.output_layer), fp);
+			if (save_bf16)
+			{
+				save_connected_weights_bf16(*(l.input_layer), fp);
+				save_connected_weights_bf16(*(l.self_layer), fp);
+				save_connected_weights_bf16(*(l.output_layer), fp);
+			}
+			else
+			{
+				save_connected_weights(*(l.input_layer), fp);
+				save_connected_weights(*(l.self_layer), fp);
+				save_connected_weights(*(l.output_layer), fp);
+			}
 		}
 		if (l.type == Darknet::ELayerType::LSTM)
 		{
-			save_connected_weights(*(l.wf), fp);
-			save_connected_weights(*(l.wi), fp);
-			save_connected_weights(*(l.wg), fp);
-			save_connected_weights(*(l.wo), fp);
-			save_connected_weights(*(l.uf), fp);
-			save_connected_weights(*(l.ui), fp);
-			save_connected_weights(*(l.ug), fp);
-			save_connected_weights(*(l.uo), fp);
+			if (save_bf16)
+			{
+				save_connected_weights_bf16(*(l.wf), fp);
+				save_connected_weights_bf16(*(l.wi), fp);
+				save_connected_weights_bf16(*(l.wg), fp);
+				save_connected_weights_bf16(*(l.wo), fp);
+				save_connected_weights_bf16(*(l.uf), fp);
+				save_connected_weights_bf16(*(l.ui), fp);
+				save_connected_weights_bf16(*(l.ug), fp);
+				save_connected_weights_bf16(*(l.uo), fp);
+			}
+			else
+			{
+				save_connected_weights(*(l.wf), fp);
+				save_connected_weights(*(l.wi), fp);
+				save_connected_weights(*(l.wg), fp);
+				save_connected_weights(*(l.wo), fp);
+				save_connected_weights(*(l.uf), fp);
+				save_connected_weights(*(l.ui), fp);
+				save_connected_weights(*(l.ug), fp);
+				save_connected_weights(*(l.uo), fp);
+			}
 		}
 		if (l.type == Darknet::ELayerType::CRNN)
 		{
-			save_convolutional_weights(*(l.input_layer), fp);
-			save_convolutional_weights(*(l.self_layer), fp);
-			save_convolutional_weights(*(l.output_layer), fp);
+			if (save_bf16)
+			{
+				save_convolutional_weights_bf16(*(l.input_layer), fp);
+				save_convolutional_weights_bf16(*(l.self_layer), fp);
+				save_convolutional_weights_bf16(*(l.output_layer), fp);
+			}
+			else
+			{
+				save_convolutional_weights(*(l.input_layer), fp);
+				save_convolutional_weights(*(l.self_layer), fp);
+				save_convolutional_weights(*(l.output_layer), fp);
+			}
 		}
 	}
 	fclose(fp);
@@ -365,6 +627,34 @@ size_t load_connected_weights(Darknet::Layer & l, FILE *fp, int transpose)
 	return bytes_read;
 }
 
+size_t load_connected_weights_bf16(Darknet::Layer & l, FILE *fp, int transpose)
+{
+	TAT(TATPARMS);
+
+	size_t bytes_read = 0;
+
+	bytes_read += xfread_bf16_to_f32(l.biases, l.outputs, fp, "biases");
+	bytes_read += xfread_bf16_to_f32(l.weights, l.outputs * l.inputs, fp, "weights");
+	if (transpose)
+	{
+		transpose_matrix(l.weights, l.inputs, l.outputs);
+	}
+	if (l.batch_normalize && (not l.dontloadscales))
+	{
+		bytes_read += xfread_bf16_to_f32(l.scales			, l.outputs, fp, "scales");
+		bytes_read += xfread_bf16_to_f32(l.rolling_mean		, l.outputs, fp, "rolling mean");
+		bytes_read += xfread_bf16_to_f32(l.rolling_variance	, l.outputs, fp, "rolling variance");
+	}
+#ifdef DARKNET_GPU
+	if (cfg_and_state.gpu_index >= 0)
+	{
+		push_connected_layer(l);
+	}
+#endif
+
+	return bytes_read;
+}
+
 
 size_t load_convolutional_weights(Darknet::Layer & l, FILE *fp)
 {
@@ -397,6 +687,36 @@ size_t load_convolutional_weights(Darknet::Layer & l, FILE *fp)
 	return bytes_read;
 }
 
+size_t load_convolutional_weights_bf16(Darknet::Layer & l, FILE *fp)
+{
+	TAT(TATPARMS);
+
+	size_t bytes_read = 0;
+	const int num = l.nweights;
+
+	bytes_read += xfread_bf16_to_f32(l.biases, l.n, fp, "biases");
+	if (l.batch_normalize && (not l.dontloadscales))
+	{
+		bytes_read += xfread_bf16_to_f32(l.scales			, l.n, fp, "scales");
+		bytes_read += xfread_bf16_to_f32(l.rolling_mean		, l.n, fp, "rolling mean");
+		bytes_read += xfread_bf16_to_f32(l.rolling_variance	, l.n, fp, "rolling variance");
+	}
+	bytes_read += xfread_bf16_to_f32(l.weights, num, fp, "weights");
+
+	if (l.flipped)
+	{
+		transpose_matrix(l.weights, (l.c / l.groups) * l.size * l.size, l.n);
+	}
+#ifdef DARKNET_GPU
+	if (cfg_and_state.gpu_index >= 0)
+	{
+		push_convolutional_layer(l);
+	}
+#endif
+
+	return bytes_read;
+}
+
 
 size_t load_shortcut_weights(Darknet::Layer & l, FILE *fp)
 {
@@ -406,6 +726,24 @@ size_t load_shortcut_weights(Darknet::Layer & l, FILE *fp)
 	int num = l.nweights;
 
 	bytes_read += xfread(l.weights, sizeof(float), num, fp, "weights");
+
+#ifdef DARKNET_GPU
+	if (cfg_and_state.gpu_index >= 0)
+	{
+		push_shortcut_layer(l);
+	}
+#endif
+
+	return bytes_read;
+}
+
+size_t load_shortcut_weights_bf16(Darknet::Layer & l, FILE *fp)
+{
+	TAT(TATPARMS);
+
+	size_t bytes_read = 0;
+	const int num = l.nweights;
+	bytes_read += xfread_bf16_to_f32(l.weights, num, fp, "weights");
 
 #ifdef DARKNET_GPU
 	if (cfg_and_state.gpu_index >= 0)
@@ -457,14 +795,34 @@ void load_weights_upto(Darknet::Network * net, const char * filename, int cutoff
 		file_error(filename, DARKNET_LOC);
 	}
 
+	bool weights_are_bf16 = false;
+	uint32_t bf16_version = 0;
 	int major;
 	int minor;
 	int revision;
-	xfread(&major	, sizeof(int), 1, fp, "major version number");
-	xfread(&minor	, sizeof(int), 1, fp, "minor version number");
-	xfread(&revision, sizeof(int), 1, fp, "patch version number");
 
-	if ((major * 10 + minor) >= 2)
+	uint32_t maybe_magic = 0;
+	if (std::fread(&maybe_magic, sizeof(uint32_t), 1, fp) == 1 && maybe_magic == k_bf16_weights_magic)
+	{
+		weights_are_bf16 = true;
+		xfread(&bf16_version, sizeof(uint32_t), 1, fp, "BF16 weights format version");
+		if (bf16_version != k_bf16_weights_version)
+		{
+			darknet_fatal_error(DARKNET_LOC, "unsupported BF16 weights format version %u", bf16_version);
+		}
+		xfread(&major, sizeof(int), 1, fp, "major version number");
+		xfread(&minor, sizeof(int), 1, fp, "minor version number");
+		xfread(&revision, sizeof(int), 1, fp, "patch version number");
+	}
+	else
+	{
+		std::fseek(fp, 0, SEEK_SET);
+		xfread(&major, sizeof(int), 1, fp, "major version number");
+		xfread(&minor, sizeof(int), 1, fp, "minor version number");
+		xfread(&revision, sizeof(int), 1, fp, "patch version number");
+	}
+
+	if (weights_are_bf16 || (major * 10 + minor) >= 2)
 	{
 		uint64_t iseen = 0;
 		xfread(&iseen, sizeof(uint64_t), 1, fp, "images seen during training");
@@ -479,6 +837,11 @@ void load_weights_upto(Darknet::Network * net, const char * filename, int cutoff
 
 	*net->cur_iteration = get_current_batch(*net);
 	int transpose = (major > 1000) || (minor > 1000);
+
+	if (cfg_and_state.is_verbose && weights_are_bf16)
+	{
+		*cfg_and_state.output << "Detected BF16 weights format v" << bf16_version << "." << std::endl;
+	}
 
 	size_t layers_with_weights = 0;
 	size_t total_bytes_read = 0;
@@ -508,7 +871,8 @@ void load_weights_upto(Darknet::Network * net, const char * filename, int cutoff
 						*cfg_and_state.output << "=> layer #" << i << " (" << Darknet::to_string(l.type) << "): loading convolutional weights" << std::endl;
 					}
 					layers_with_weights ++;
-					bytes_read += load_convolutional_weights(l, fp);
+					if (weights_are_bf16) bytes_read += load_convolutional_weights_bf16(l, fp);
+					else bytes_read += load_convolutional_weights(l, fp);
 				}
 				if (cfg_and_state.is_trace)
 				{
@@ -527,7 +891,8 @@ void load_weights_upto(Darknet::Network * net, const char * filename, int cutoff
 						*cfg_and_state.output << "=> layer #" << i << " (" << Darknet::to_string(l.type) << "): loading shortcut weights" << std::endl;
 					}
 					layers_with_weights ++;
-					bytes_read += load_shortcut_weights(l, fp);
+					if (weights_are_bf16) bytes_read += load_shortcut_weights_bf16(l, fp);
+					else bytes_read += load_shortcut_weights(l, fp);
 				}
 				if (cfg_and_state.is_trace)
 				{
@@ -544,7 +909,8 @@ void load_weights_upto(Darknet::Network * net, const char * filename, int cutoff
 					*cfg_and_state.output << "=> layer #" << i << " (" << Darknet::to_string(l.type) << "): loading connected weights" << std::endl;
 				}
 				layers_with_weights ++;
-				bytes_read += load_connected_weights(l, fp, transpose);
+				if (weights_are_bf16) bytes_read += load_connected_weights_bf16(l, fp, transpose);
+				else bytes_read += load_connected_weights(l, fp, transpose);
 				if (cfg_and_state.is_trace)
 				{
 					*cfg_and_state.output << "-> layer #" << i << " (" << Darknet::to_string(l.type) << "): loaded " << Darknet::size_to_IEC_string(bytes_read) << std::endl;
@@ -560,9 +926,18 @@ void load_weights_upto(Darknet::Network * net, const char * filename, int cutoff
 					*cfg_and_state.output << "=> layer #" << i << " (" << Darknet::to_string(l.type) << "): loading convolutional weights" << std::endl;
 				}
 				layers_with_weights ++;
-				bytes_read += load_convolutional_weights(*(l.input_layer)	, fp);
-				bytes_read += load_convolutional_weights(*(l.self_layer)	, fp);
-				bytes_read += load_convolutional_weights(*(l.output_layer)	, fp);
+				if (weights_are_bf16)
+				{
+					bytes_read += load_convolutional_weights_bf16(*(l.input_layer), fp);
+					bytes_read += load_convolutional_weights_bf16(*(l.self_layer), fp);
+					bytes_read += load_convolutional_weights_bf16(*(l.output_layer), fp);
+				}
+				else
+				{
+					bytes_read += load_convolutional_weights(*(l.input_layer), fp);
+					bytes_read += load_convolutional_weights(*(l.self_layer), fp);
+					bytes_read += load_convolutional_weights(*(l.output_layer), fp);
+				}
 				if (cfg_and_state.is_trace)
 				{
 					*cfg_and_state.output << "-> layer #" << i << " (" << Darknet::to_string(l.type) << "): loaded " << Darknet::size_to_IEC_string(bytes_read) << std::endl;
@@ -578,9 +953,18 @@ void load_weights_upto(Darknet::Network * net, const char * filename, int cutoff
 					*cfg_and_state.output << "=> layer #" << i << " (" << Darknet::to_string(l.type) << "): loading connected weights" << std::endl;
 				}
 				layers_with_weights ++;
-				bytes_read += load_connected_weights(*(l.input_layer)	, fp, transpose);
-				bytes_read += load_connected_weights(*(l.self_layer)	, fp, transpose);
-				bytes_read += load_connected_weights(*(l.output_layer)	, fp, transpose);
+				if (weights_are_bf16)
+				{
+					bytes_read += load_connected_weights_bf16(*(l.input_layer), fp, transpose);
+					bytes_read += load_connected_weights_bf16(*(l.self_layer), fp, transpose);
+					bytes_read += load_connected_weights_bf16(*(l.output_layer), fp, transpose);
+				}
+				else
+				{
+					bytes_read += load_connected_weights(*(l.input_layer), fp, transpose);
+					bytes_read += load_connected_weights(*(l.self_layer), fp, transpose);
+					bytes_read += load_connected_weights(*(l.output_layer), fp, transpose);
+				}
 				if (cfg_and_state.is_trace)
 				{
 					*cfg_and_state.output << "-> layer #" << i << " (" << Darknet::to_string(l.type) << "): loaded " << Darknet::size_to_IEC_string(bytes_read) << std::endl;
@@ -596,14 +980,28 @@ void load_weights_upto(Darknet::Network * net, const char * filename, int cutoff
 					*cfg_and_state.output << "=> layer #" << i << " (" << Darknet::to_string(l.type) << "): loading connected weights" << std::endl;
 				}
 				layers_with_weights ++;
-				bytes_read += load_connected_weights(*(l.wf), fp, transpose);
-				bytes_read += load_connected_weights(*(l.wi), fp, transpose);
-				bytes_read += load_connected_weights(*(l.wg), fp, transpose);
-				bytes_read += load_connected_weights(*(l.wo), fp, transpose);
-				bytes_read += load_connected_weights(*(l.uf), fp, transpose);
-				bytes_read += load_connected_weights(*(l.ui), fp, transpose);
-				bytes_read += load_connected_weights(*(l.ug), fp, transpose);
-				bytes_read += load_connected_weights(*(l.uo), fp, transpose);
+				if (weights_are_bf16)
+				{
+					bytes_read += load_connected_weights_bf16(*(l.wf), fp, transpose);
+					bytes_read += load_connected_weights_bf16(*(l.wi), fp, transpose);
+					bytes_read += load_connected_weights_bf16(*(l.wg), fp, transpose);
+					bytes_read += load_connected_weights_bf16(*(l.wo), fp, transpose);
+					bytes_read += load_connected_weights_bf16(*(l.uf), fp, transpose);
+					bytes_read += load_connected_weights_bf16(*(l.ui), fp, transpose);
+					bytes_read += load_connected_weights_bf16(*(l.ug), fp, transpose);
+					bytes_read += load_connected_weights_bf16(*(l.uo), fp, transpose);
+				}
+				else
+				{
+					bytes_read += load_connected_weights(*(l.wf), fp, transpose);
+					bytes_read += load_connected_weights(*(l.wi), fp, transpose);
+					bytes_read += load_connected_weights(*(l.wg), fp, transpose);
+					bytes_read += load_connected_weights(*(l.wo), fp, transpose);
+					bytes_read += load_connected_weights(*(l.uf), fp, transpose);
+					bytes_read += load_connected_weights(*(l.ui), fp, transpose);
+					bytes_read += load_connected_weights(*(l.ug), fp, transpose);
+					bytes_read += load_connected_weights(*(l.uo), fp, transpose);
+				}
 				if (cfg_and_state.is_trace)
 				{
 					*cfg_and_state.output << "-> layer #" << i << " (" << Darknet::to_string(l.type) << "): loaded " << Darknet::size_to_IEC_string(bytes_read) << std::endl;

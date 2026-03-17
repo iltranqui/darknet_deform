@@ -1,5 +1,5 @@
 /* Darknet/YOLO:  https://codeberg.org/CCodeRun/darknet
- * Copyright 2024-2025 Stephane Charette
+ * Copyright 2024-2026 Stephane Charette
  */
 
 #pragma once
@@ -124,6 +124,18 @@ namespace Darknet
 			 * @see @ref is_verbose
 			 */
 			bool is_trace;
+
+			/// Whether CUDA/cuDNN BF16 mixed precision is enabled for this run.
+			bool use_cudnn_bf16;
+
+			/// Whether CUDA/cuDNN FP8 mixed precision is enabled for this run.
+			bool use_cudnn_fp8;
+
+			/// When true, BF16 weight storage is authoritative for the active BF16 master-weight mode.
+			bool use_bf16_master_weights;
+
+			/// Active runtime precision mode selected for this run.
+			Darknet::PrecisionMode precision_mode;
 
 			/// Every argument starting with @p argv[0], unmodified, and in the exact order they were specified.
 			VStr argv;

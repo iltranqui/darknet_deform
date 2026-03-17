@@ -1,5 +1,5 @@
 /* Darknet/YOLO:  https://codeberg.org/CCodeRun/darknet
- * Copyright 2024-2025 Stephane Charette
+ * Copyright 2024-2026 Stephane Charette
  */
 
 #pragma once
@@ -77,9 +77,12 @@ namespace Darknet
 		int flip;
 		int index; ///< layer number starting at zero ([net] does not count)
 		int scale_wh;
-		int binary;
-		int xnor;
-		int peephole;
+			int binary;
+			int xnor;
+			int fp8_enabled;
+			int fp8_format;
+			int fp8_weight_cache_iteration;
+			int peephole;
 		int use_bin_output;
 		int keep_delta_gpu;
 		int optimized_memory;
@@ -436,15 +439,29 @@ namespace Darknet
 
 		float * col_image_gpu;
 
-		float * x_gpu;
-		float * x_norm_gpu;
-		float * weights_gpu;
-		float * weight_updates_gpu;
-		float * weight_deform_gpu;
-		float * weight_change_gpu;
+			float * x_gpu;
+			float * x_norm_gpu;
+			float * weights_gpu;
+			float * weight_updates_gpu;
+			float * weight_deform_gpu;
+			float * weight_change_gpu;
+			uint8_t *weights_fp8_gpu;
+			uint8_t *act_fp8_gpu;
+			float *w_scale_gpu;
+			float *x_scale_gpu;
+			float *grad_scale_gpu;    // Per-layer gradient amax scratch for current scaling (E5M2)
+			float *grad_amax_ema_gpu;
+			float *w_amax_ema_gpu;
+			float *x_amax_ema_gpu;
+			float w_scale;
+			float x_scale;
+			float w_amax_ema;
+			float x_amax_ema;
 
 		float * weights_gpu16;
+		float * weights_conv_gpu16;
 		float * weight_updates_gpu16;
+		float * weight_compensation_gpu;
 
 		float * biases_gpu;
 		float * bias_updates_gpu;
@@ -456,6 +473,7 @@ namespace Darknet
 
 		float * input_antialiasing_gpu;
 		float * output_gpu;
+		float * output_gpu16; ///< BF16 activations (2 bytes/elem packed into float*), active when use_cudnn_bf16
 		float * output_avg_gpu;
 		float * activation_input_gpu;
 		float * loss_gpu;

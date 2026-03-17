@@ -131,8 +131,14 @@ void dump(Darknet::Network * net, const Darknet::CfgFile::CommonParms & parms)
 		<< "steps="							<< dump(net->steps, net->num_steps)		<< std::endl
 		<< "num_steps="						<< net->num_steps						<< std::endl
 		<< "burn_in="						<< net->burn_in							<< std::endl
-		<< "cudnn_half="					<< net->cudnn_half						<< std::endl
-		<< "adam="							<< net->adam							<< std::endl
+			<< "cudnn_half="					<< net->cudnn_half						<< std::endl
+			<< "cudnn_bfloat16="				<< net->cudnn_bfloat16					<< std::endl
+			<< "cudnn_fp8="						<< net->cudnn_fp8						<< std::endl
+			<< "precision_mode="				<< static_cast<int>(net->precision_mode)	<< std::endl
+			<< "fp8_aggressive="				<< net->fp8_aggressive					<< std::endl
+			<< "fp8_requant_interval="			<< net->fp8_requant_interval			<< std::endl
+			<< "fp8_scale_update_interval="		<< net->fp8_scale_update_interval		<< std::endl
+			<< "adam="							<< net->adam							<< std::endl
 		<< "B1="							<< net->B1								<< std::endl
 		<< "B2="							<< net->B2								<< std::endl
 		<< "eps="							<< net->eps								<< std::endl

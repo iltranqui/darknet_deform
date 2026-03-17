@@ -201,6 +201,12 @@ Darknet::Network make_network(int n)
 
 	Darknet::Network net = {0};
 	net.n = n;
+	net.precision_mode = Darknet::PrecisionMode::FP32;
+	net.fp8_aggressive = 0;
+	net.fp8_requant_interval = 1;
+	net.fp8_scale_update_interval = 1;
+	net.fp8_debug = 0;
+	net.fp8_current_scaling = 1;
 	net.layers = (Darknet::Layer*)xcalloc(net.n, sizeof(Darknet::Layer));
 	net.seen = (uint64_t*)xcalloc(1, sizeof(uint64_t));
 	net.cuda_graph_ready = (int*)xcalloc(1, sizeof(int));
@@ -242,9 +248,29 @@ void forward_network(Darknet::Network & net, Darknet::NetworkState state)
 		{
 			scal_cpu(l.outputs * l.batch, 0, l.delta, 1);
 		}
+#ifdef DARKNET_USE_MPS
+		if (i > 0)
+		{
+			Darknet::Layer & prev = net.layers[i - 1];
+			if (mps_is_output_deferred(&prev) and not mps_layer_can_run(l, state.train))
+			{
+				mps_flush_output_if_needed(&prev, prev.output);
+			}
+		}
+#endif
 		l.forward(l, state);
 		state.input = l.output;
 	}
+#ifdef DARKNET_USE_MPS
+	if (net.n > 0)
+	{
+		Darknet::Layer & last = net.layers[net.n - 1];
+		if (mps_is_output_deferred(&last))
+		{
+			mps_flush_output_if_needed(&last, last.output);
+		}
+	}
+#endif
 }
 
 

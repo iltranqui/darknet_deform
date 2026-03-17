@@ -283,16 +283,27 @@ void free_layer_custom(Darknet::Layer & l, int keep_cudnn_desc)
 	if (l.align_workspace_gpu)			cuda_free_and_clear(l.align_workspace_gpu);
 	if (l.transposed_align_workspace_gpu) cuda_free_and_clear(l.transposed_align_workspace_gpu);
 
-	if (l.weights_gpu)					cuda_free_and_clear(l.weights_gpu);
-	if (l.weight_updates_gpu)			cuda_free_and_clear(l.weight_updates_gpu);
-	if (l.weight_deform_gpu)			cuda_free_and_clear(l.weight_deform_gpu);
-	if (l.weights_gpu16)				cuda_free_and_clear(l.weights_gpu16);
+	if (l.weights_gpu)				cuda_free_and_clear(l.weights_gpu);
+	if (l.weight_updates_gpu)		cuda_free_and_clear(l.weight_updates_gpu);
+	if (l.weight_deform_gpu)		cuda_free_and_clear(l.weight_deform_gpu);
+	if (l.weights_fp8_gpu)			{cuda_free((float *)l.weights_fp8_gpu);	l.weights_fp8_gpu = nullptr;}
+	if (l.act_fp8_gpu)				{cuda_free((float *)l.act_fp8_gpu);		l.act_fp8_gpu = nullptr;}
+	if (l.w_scale_gpu)				cuda_free_and_clear(l.w_scale_gpu);
+	if (l.x_scale_gpu)				cuda_free_and_clear(l.x_scale_gpu);
+	if (l.grad_scale_gpu)			cuda_free_and_clear(l.grad_scale_gpu);
+	if (l.grad_amax_ema_gpu)		cuda_free_and_clear(l.grad_amax_ema_gpu);
+	if (l.w_amax_ema_gpu)			cuda_free_and_clear(l.w_amax_ema_gpu);
+	if (l.x_amax_ema_gpu)			cuda_free_and_clear(l.x_amax_ema_gpu);
+	if (l.weights_gpu16)			cuda_free_and_clear(l.weights_gpu16);
+	if (l.weights_conv_gpu16)		cuda_free_and_clear(l.weights_conv_gpu16);
 	if (l.weight_updates_gpu16)			cuda_free_and_clear(l.weight_updates_gpu16);
+	if (l.weight_compensation_gpu)		cuda_free_and_clear(l.weight_compensation_gpu);
 	if (l.biases_gpu)					cuda_free_and_clear(l.biases_gpu);
 	if (l.bias_updates_gpu)				cuda_free_and_clear(l.bias_updates_gpu);
 	if (l.scales_gpu)					cuda_free_and_clear(l.scales_gpu);
 	if (l.scale_updates_gpu)			cuda_free_and_clear(l.scale_updates_gpu);
 	if (l.input_antialiasing_gpu)		cuda_free_and_clear(l.input_antialiasing_gpu);
+	if (l.output_gpu16)				cuda_free_and_clear(l.output_gpu16);
 	if (l.optimized_memory < 2)
 	{
 		if (l.x_gpu)					cuda_free_and_clear(l.x_gpu);

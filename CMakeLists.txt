@@ -53,3 +53,11 @@ IF (GTEST)
 	ENABLE_TESTING ()
 	ADD_SUBDIRECTORY (src-test)
 ENDIF ()
+
+# Precision Mode Hardware Requirements Notice
+MESSAGE (STATUS "--------------------------------------------------------------------------------")
+MESSAGE (STATUS "DARKNET: Precision Mode Hardware Requirements Notice:")
+MESSAGE (STATUS "  - BF16 (BFloat16): Requires at least CUDA compute capability 8.0 (Ampere+)")
+MESSAGE (STATUS "  - FP8:             Requires at least CUDA compute capability 8.9 (Ada Lovelace+)")
+MESSAGE (STATUS "Please ensure your DARKNET_CUDA_ARCHITECTURES includes these if using these modes.")
+MESSAGE (STATUS "--------------------------------------------------------------------------------")

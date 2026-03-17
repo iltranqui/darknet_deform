@@ -2,11 +2,24 @@
 #include "gemm.hpp"
 #include "col2im.hpp"
 #include "im2col.hpp"
+#ifdef DARKNET_GPU_CUDA
+#include <cuda_bf16.h>
+#if CUDART_VERSION >= 12000
+#include <cuda_fp8.h>
+#endif
+#endif
 
 
 namespace
 {
 	static auto & cfg_and_state = Darknet::CfgAndState::get();
+
+#if defined(DARKNET_GPU_CUDA) && (CUDART_VERSION >= 12000)
+	constexpr float k_fp8_e4m3_max = 448.0f;
+	constexpr float k_fp8_e5m2_max = 57344.0f;
+	constexpr float k_fp8_ema_decay = 0.95f;
+	constexpr float k_fp8_min_scale = 1.0e-8f;
+#endif
 }
 
 
@@ -178,6 +191,861 @@ half *cuda_make_f16_from_f32_array(float *src, size_t n)
 	return dst16;
 }
 
+#if defined(DARKNET_GPU_CUDA) && (CUDART_VERSION >= 11000)
+__global__ void cuda_f32_to_bf16(float* input_f32, size_t size, __nv_bfloat16 *output_bf16)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx < size) output_bf16[idx] = __float2bfloat16(input_f32[idx]);
+}
+
+void cuda_convert_f32_to_bf16(float* input_f32, size_t size, float *output_bf16)
+{
+	TAT(TATPARMS);
+
+	cuda_f32_to_bf16 <<< get_number_of_blocks(size, BLOCK), BLOCK, 0, get_cuda_stream() >>> (input_f32, size, (__nv_bfloat16 *)output_bf16);
+	CHECK_CUDA(cudaPeekAtLastError());
+}
+
+__global__ void cuda_bf16_to_f32(__nv_bfloat16* input_bf16, size_t size, float *output_f32)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx < size) output_f32[idx] = __bfloat162float(input_bf16[idx]);
+}
+
+void cuda_convert_bf16_to_f32(float* input_bf16, size_t size, float *output_f32)
+{
+	TAT(TATPARMS);
+
+	cuda_bf16_to_f32 <<< get_number_of_blocks(size, BLOCK), BLOCK, 0, get_cuda_stream() >>> ((__nv_bfloat16 *)input_bf16, size, output_f32);
+	CHECK_CUDA(cudaPeekAtLastError());
+}
+
+/// Rounds each FP32 value to BF16 precision in-place (stores result back as FP32).
+/// After this call every element has at most 7 mantissa bits — identical semantics to
+/// storing in BF16 but the buffer stays float* so all existing kernels continue to work.
+__global__ void cuda_round_to_bf16_kernel(float * __restrict__ data, size_t n)
+{
+	const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+	if (i < n)
+	{
+		data[i] = __bfloat162float(__float2bfloat16(data[i]));
+	}
+}
+
+void cuda_round_f32_to_bf16_inplace(float * data, size_t n)
+{
+	TAT(TATPARMS);
+
+	cuda_round_to_bf16_kernel <<< get_number_of_blocks(n, BLOCK), BLOCK, 0, get_cuda_stream() >>> (data, n);
+	CHECK_CUDA(cudaPeekAtLastError());
+}
+
+__nv_bfloat16 *cuda_make_bf16_from_f32_array(float *src, size_t n)
+{
+	TAT(TATPARMS);
+
+	__nv_bfloat16 *dst16;
+	size_t size = sizeof(__nv_bfloat16) * n;
+	CHECK_CUDA(cudaMalloc((void **)&dst16, size));
+	if (src)
+	{
+		assert(n > 0);
+		cuda_convert_f32_to_bf16(src, n, (float *)dst16);
+	}
+	if (!dst16)
+	{
+		darknet_fatal_error(DARKNET_LOC, "CUDA malloc failed (n=%d)", n);
+	}
+	return dst16;
+}
+
+void* cuda_make_lowp_from_f32_array(float* src, size_t n, bool is_bf16)
+{
+#if defined(DARKNET_GPU_CUDA) && (CUDART_VERSION >= 11000)
+	if (is_bf16) return cuda_make_bf16_from_f32_array(src, n);
+#endif
+	return cuda_make_f16_from_f32_array(src, n);
+}
+
+void cuda_convert_f32_to_lowp(float* src, size_t n, void* dst, bool is_bf16)
+{
+#if defined(DARKNET_GPU_CUDA) && (CUDART_VERSION >= 11000)
+	if (is_bf16)
+	{
+		cuda_convert_f32_to_bf16(src, n, (float*)dst);
+		return;
+	}
+#endif
+	cuda_convert_f32_to_f16(src, n, (float*)dst);
+}
+
+void cuda_convert_lowp_to_f32(void* src, size_t n, float* dst, bool is_bf16)
+{
+#if defined(DARKNET_GPU_CUDA) && (CUDART_VERSION >= 11000)
+	if (is_bf16)
+	{
+		cuda_convert_bf16_to_f32((float*)src, n, dst);
+		return;
+	}
+#endif
+	cuda_convert_f16_to_f32((float*)src, n, dst);
+}
+
+bool use_bf16_master_weight_storage(const Darknet::Layer & l)
+{
+	return (cfg_and_state.use_bf16_master_weights && l.weights_gpu16);
+}
+
+static inline bool layer_can_use_lowp_conv(const Darknet::Network & net, const Darknet::Layer & l, const bool train)
+{
+	if (l.type != Darknet::ELayerType::CONVOLUTIONAL || l.xnor)
+	{
+		return false;
+	}
+
+	const int iteration_num = get_current_iteration(net);
+	const int tensor_cores_min_iteration = std::max(0, net.tensor_cores_min_iteration);
+	const bool bf16_compute_mode = (
+		net.precision_mode == Darknet::PrecisionMode::BF16 ||
+		net.precision_mode == Darknet::PrecisionMode::BF16_MASTER_KAHAN ||
+		net.precision_mode == Darknet::PrecisionMode::FP8_BF16 ||
+		net.cudnn_bfloat16 || net.cudnn_fp8);
+	const bool allow_bf16_tensor_core_now = (!train || net.loss_scale > 1.0f || iteration_num >= tensor_cores_min_iteration);
+	const bool tc_aligned = ((l.c / std::max(1, l.groups)) % 8 == 0 && l.n % 8 == 0 && l.groups <= 1);
+
+	return (bf16_compute_mode && allow_bf16_tensor_core_now && tc_aligned);
+}
+
+static inline bool next_layer_can_consume_cached_bf16_output(const Darknet::Network & net, const Darknet::Layer & l, const int state_index, const bool train)
+{
+	if (l.output_gpu16 == nullptr || state_index < 0 || state_index + 1 >= net.n)
+	{
+		return false;
+	}
+
+	if (&net.layers[state_index] != &l)
+	{
+		return false;
+	}
+
+	if (!layer_can_use_lowp_conv(net, l, train))
+	{
+		return false;
+	}
+
+	const Darknet::Layer & next = net.layers[state_index + 1];
+	return (layer_can_use_lowp_conv(net, next, train) && !(net.cudnn_fp8 && next.fp8_enabled > 0));
+}
+
+static inline bool can_materialize_post_activation_bf16_cache(const Darknet::Network & net, const Darknet::Layer & l, const bool cache_bf16_output)
+{
+#if defined(DARKNET_GPU_CUDA) && (CUDART_VERSION >= 11000)
+	return (
+		cache_bf16_output &&
+		l.output_gpu16 != nullptr &&
+		!net.try_fix_nan &&
+		!l.assisted_excitation &&
+		!l.antialiasing &&
+		!l.coordconv &&
+		can_activate_array_bf16_ongpu(l.activation));
+#else
+	(void)net;
+	(void)l;
+	(void)cache_bf16_output;
+	return false;
+#endif
+}
+
+static inline float *get_lowp_convolution_weights_gpu16(Darknet::Layer & l, const bool fp8_layer_enabled)
+{
+	if (fp8_layer_enabled && use_bf16_master_weight_storage(l) && l.weights_conv_gpu16)
+	{
+		return l.weights_conv_gpu16;
+	}
+
+	return l.weights_gpu16;
+}
+
+class ScopedConvolutionalWeightsF32Scratch
+{
+public:
+	ScopedConvolutionalWeightsF32Scratch(Darknet::Layer & layer, bool needs_scratch)
+		: l(layer), original_weights_gpu(layer.weights_gpu), scratch_weights_gpu(nullptr)
+	{
+		if (needs_scratch && use_bf16_master_weight_storage(layer))
+		{
+			scratch_weights_gpu = cuda_make_array(NULL, layer.nweights);
+			cuda_convert_bf16_to_f32(layer.weights_gpu16, layer.nweights, scratch_weights_gpu);
+			l.weights_gpu = scratch_weights_gpu;
+		}
+	}
+
+	~ScopedConvolutionalWeightsF32Scratch()
+	{
+		if (scratch_weights_gpu)
+		{
+			cuda_free(scratch_weights_gpu);
+			l.weights_gpu = original_weights_gpu;
+		}
+	}
+
+	bool active() const
+	{
+		return (scratch_weights_gpu != nullptr);
+	}
+
+private:
+	Darknet::Layer & l;
+	float * original_weights_gpu;
+	float * scratch_weights_gpu;
+};
+
+__global__ void bf16_kahan_sgd_kernel(
+	int n,
+	float lr,
+	float decay_factor,
+	float momentum_factor,
+	float * weight_updates,
+	__nv_bfloat16 * weights_bf16,
+	__nv_bfloat16 * compensation,
+	float * weights_f32_mirror)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+
+	float w = __bfloat162float(weights_bf16[i]);
+	float c = __bfloat162float(compensation[i]);
+
+	if (!isfinite(w)) w = 0.0f;
+	if (!isfinite(c)) c = 0.0f;
+
+	float grad = weight_updates[i];
+	grad += decay_factor * w;
+
+	float update = lr * grad + c;
+	float new_w = w + update;
+	float new_c = (w - new_w) + update;
+
+	weights_bf16[i] = __float2bfloat16(new_w);
+	compensation[i] = __float2bfloat16(new_c);
+	if (weights_f32_mirror) weights_f32_mirror[i] = new_w;
+	weight_updates[i] = grad * momentum_factor;
+}
+
+void cuda_bf16_kahan_sgd(int n, float lr, float decay_factor, float momentum_factor,
+	float * weight_updates, float * weights_bf16, float * compensation_bf16, float * weights_f32_mirror)
+{
+	TAT(TATPARMS);
+	bf16_kahan_sgd_kernel <<< get_number_of_blocks(n, BLOCK), BLOCK, 0, get_cuda_stream() >>> (
+		n, lr, decay_factor, momentum_factor,
+		weight_updates,
+		reinterpret_cast<__nv_bfloat16 *>(weights_bf16),
+		reinterpret_cast<__nv_bfloat16 *>(compensation_bf16),
+		weights_f32_mirror);
+	CHECK_CUDA(cudaPeekAtLastError());
+}
+
+__global__ void bf16_kahan_commit_kernel(
+	int n,
+	const float * weights_f32,
+	__nv_bfloat16 * weights_bf16,
+	__nv_bfloat16 * compensation)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+
+	float w = weights_f32[i];
+	float c = __bfloat162float(compensation[i]);
+	float compensated = w + c;
+	__nv_bfloat16 bf16_val = __float2bfloat16(compensated);
+	float new_c = compensated - __bfloat162float(bf16_val);
+
+	weights_bf16[i] = bf16_val;
+	compensation[i] = __float2bfloat16(new_c);
+}
+
+void cuda_bf16_kahan_commit(int n, const float * weights_f32, float * weights_bf16, float * compensation_bf16)
+{
+	TAT(TATPARMS);
+	bf16_kahan_commit_kernel <<< get_number_of_blocks(n, BLOCK), BLOCK, 0, get_cuda_stream() >>> (
+		n, weights_f32,
+		reinterpret_cast<__nv_bfloat16 *>(weights_bf16),
+		reinterpret_cast<__nv_bfloat16 *>(compensation_bf16));
+	CHECK_CUDA(cudaPeekAtLastError());
+}
+#endif
+
+#if defined(DARKNET_GPU_CUDA) && (CUDART_VERSION >= 12000)
+__global__ void cuda_f32_to_fp8(float* input_f32, size_t size, __nv_fp8_e4m3 *output_fp8)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx < size)
+	{
+		// Use __NV_SATFINITE to clamp overflows to ±448 instead of NaN
+		__nv_fp8_storage_t s = __nv_cvt_float_to_fp8(input_f32[idx], __NV_SATFINITE, __NV_E4M3);
+		output_fp8[idx] = *reinterpret_cast<__nv_fp8_e4m3*>(&s);
+	}
+}
+
+void cuda_convert_f32_to_fp8(float* input_f32, size_t size, float *output_fp8)
+{
+	TAT(TATPARMS);
+
+	cuda_f32_to_fp8 <<< get_number_of_blocks(size, BLOCK), BLOCK, 0, get_cuda_stream() >>> (input_f32, size, (__nv_fp8_e4m3 *)output_fp8);
+	CHECK_CUDA(cudaPeekAtLastError());
+}
+
+__global__ void cuda_fp8_to_f32(__nv_fp8_e4m3* input_fp8, size_t size, float *output_f32)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx < size) output_f32[idx] = static_cast<float>(input_fp8[idx]);
+}
+
+void cuda_convert_fp8_to_f32(float* input_fp8, size_t size, float *output_f32)
+{
+	TAT(TATPARMS);
+
+	cuda_fp8_to_f32 <<< get_number_of_blocks(size, BLOCK), BLOCK, 0, get_cuda_stream() >>> ((__nv_fp8_e4m3 *)input_fp8, size, output_f32);
+	CHECK_CUDA(cudaPeekAtLastError());
+}
+
+__global__ void cuda_f32_to_bf16_via_fp8_kernel(float* input_f32, size_t size, __nv_bfloat16 *output_bf16)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx < size)
+	{
+		// Use __NV_SATFINITE to clamp overflows to ±448 instead of NaN
+		const __nv_fp8_storage_t s = __nv_cvt_float_to_fp8(input_f32[idx], __NV_SATFINITE, __NV_E4M3);
+		const __half_raw hr = __nv_cvt_fp8_to_halfraw(s, __NV_E4M3);
+		output_bf16[idx] = __float2bfloat16(__half2float(*reinterpret_cast<const __half *>(&hr)));
+	}
+}
+
+void cuda_convert_f32_to_bf16_via_fp8(float* input_f32, size_t size, float *output_bf16)
+{
+	TAT(TATPARMS);
+
+	cuda_f32_to_bf16_via_fp8_kernel <<< get_number_of_blocks(size, BLOCK), BLOCK, 0, get_cuda_stream() >>> (input_f32, size, (__nv_bfloat16 *)output_bf16);
+	CHECK_CUDA(cudaPeekAtLastError());
+}
+
+__global__ void fp8_reduce_absmax_kernel(const float *input_f32, size_t size, float *amax_out)
+{
+	float local_max = 0.0f;
+	for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size; idx += blockDim.x * gridDim.x)
+	{
+		const float v = input_f32[idx];
+		if (isfinite(v))
+		{
+			local_max = fmaxf(local_max, fabsf(v));
+		}
+	}
+
+	__shared__ float smem[BLOCK];
+	smem[threadIdx.x] = local_max;
+	__syncthreads();
+
+	for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+	{
+		if (threadIdx.x < stride)
+		{
+			smem[threadIdx.x] = fmaxf(smem[threadIdx.x], smem[threadIdx.x + stride]);
+		}
+		__syncthreads();
+	}
+
+	if (threadIdx.x == 0)
+	{
+		float result = smem[0];
+		if (!isfinite(result)) result = 0.0f;  // NaN guard: prevent poisoning the amax
+		atomicMax((unsigned int *)amax_out, __float_as_uint(result));
+	}
+}
+
+__global__ void fp8_reduce_absmax_bf16_kernel(const __nv_bfloat16 *input_bf16, size_t size, float *amax_out)
+{
+	float local_max = 0.0f;
+	for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size; idx += blockDim.x * gridDim.x)
+	{
+		const float v = __bfloat162float(input_bf16[idx]);
+		if (isfinite(v))
+		{
+			local_max = fmaxf(local_max, fabsf(v));
+		}
+	}
+
+	__shared__ float smem[BLOCK];
+	smem[threadIdx.x] = local_max;
+	__syncthreads();
+
+	for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+	{
+		if (threadIdx.x < stride)
+		{
+			smem[threadIdx.x] = fmaxf(smem[threadIdx.x], smem[threadIdx.x + stride]);
+		}
+		__syncthreads();
+	}
+
+	if (threadIdx.x == 0)
+	{
+		float result = smem[0];
+		if (!isfinite(result)) result = 0.0f;
+		atomicMax((unsigned int *)amax_out, __float_as_uint(result));
+	}
+}
+
+__global__ void fp8_update_scale_from_amax_kernel(float *scale_gpu, float *amax_ema_gpu, float decay, float fp8_max, float min_scale)
+{
+	float amax = *scale_gpu;
+	float amax_ema = *amax_ema_gpu;
+
+	if (!isfinite(amax) || amax < 0.0f) amax = 0.0f;
+	if (!isfinite(amax_ema) || amax_ema < 0.0f) amax_ema = 0.0f;
+
+	amax_ema = fmaxf(amax_ema * decay, amax);
+	float scale = fmaxf(amax_ema / fp8_max, min_scale);
+	if (!isfinite(scale))
+	{
+		scale = 1.0f;
+		amax_ema = fp8_max;
+	}
+
+	*amax_ema_gpu = amax_ema;
+	*scale_gpu = scale;
+}
+
+template<typename TFP8>
+__device__ inline TFP8 safe_cast_to_fp8(float val);
+
+template<>
+__device__ inline __nv_fp8_e4m3 safe_cast_to_fp8<__nv_fp8_e4m3>(float val) {
+	__nv_fp8_storage_t s = __nv_cvt_float_to_fp8(val, __NV_SATFINITE, __NV_E4M3);
+	return *reinterpret_cast<__nv_fp8_e4m3*>(&s);
+}
+
+template<>
+__device__ inline __nv_fp8_e5m2 safe_cast_to_fp8<__nv_fp8_e5m2>(float val) {
+	__nv_fp8_storage_t s = __nv_cvt_float_to_fp8(val, __NV_SATFINITE, __NV_E5M2);
+	return *reinterpret_cast<__nv_fp8_e5m2*>(&s);
+}
+
+template<typename TFP8>
+__global__ void fp8_quantize_scaled_kernel(const float *input_f32, size_t size, const float *scale_gpu, float fp8_max, TFP8 *output_fp8)
+{
+	const float scale = fmaxf(*scale_gpu, k_fp8_min_scale);
+	const float inv_scale = 1.0f / scale;
+
+	for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size; idx += blockDim.x * gridDim.x)
+	{
+		float val = input_f32[idx];
+		if (!isfinite(val))
+		{
+			val = 0.0f;
+		}
+
+		float q = val * inv_scale;
+		q = fminf(fmaxf(q, -fp8_max), fp8_max);
+		output_fp8[idx] = safe_cast_to_fp8<TFP8>(q);
+	}
+}
+
+template<typename TFP8>
+__global__ void fp8_dequantize_to_bf16_kernel(const TFP8 *input_fp8, size_t size, const float *scale_gpu, __nv_bfloat16 *output_bf16)
+{
+	const float scale = fmaxf(*scale_gpu, k_fp8_min_scale);
+
+	for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size; idx += blockDim.x * gridDim.x)
+	{
+		const float val = static_cast<float>(input_fp8[idx]) * scale;
+		output_bf16[idx] = __float2bfloat16(val);
+	}
+}
+
+template<typename TFP8>
+__global__ void fp8_f32_to_bf16_scaled_kernel(const float *input_f32, size_t size, const float *scale_gpu, float fp8_max, __nv_bfloat16 *output_bf16)
+{
+	const float scale = fmaxf(*scale_gpu, k_fp8_min_scale);
+	const float inv_scale = 1.0f / scale;
+
+	for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size; idx += blockDim.x * gridDim.x)
+	{
+		float val = input_f32[idx];
+		if (!isfinite(val))
+		{
+			val = 0.0f;
+		}
+
+		float q = val * inv_scale;
+		q = fminf(fmaxf(q, -fp8_max), fp8_max);
+		const TFP8 q8 = safe_cast_to_fp8<TFP8>(q);
+		output_bf16[idx] = __float2bfloat16(static_cast<float>(q8) * scale);
+	}
+}
+
+template<typename TFP8>
+__global__ void fp8_quantize_bf16_scaled_kernel(const __nv_bfloat16 *input_bf16, size_t size, const float *scale_gpu, float fp8_max, TFP8 *output_fp8)
+{
+	const float scale = fmaxf(*scale_gpu, k_fp8_min_scale);
+	const float inv_scale = 1.0f / scale;
+
+	for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size; idx += blockDim.x * gridDim.x)
+	{
+		float val = __bfloat162float(input_bf16[idx]);
+		if (!isfinite(val))
+		{
+			val = 0.0f;
+		}
+
+		float q = val * inv_scale;
+		q = fminf(fmaxf(q, -fp8_max), fp8_max);
+		output_fp8[idx] = safe_cast_to_fp8<TFP8>(q);
+	}
+}
+
+template<typename TFP8>
+__global__ void fp8_bf16_to_bf16_scaled_kernel(const __nv_bfloat16 *input_bf16, size_t size, const float *scale_gpu, float fp8_max, __nv_bfloat16 *output_bf16)
+{
+	const float scale = fmaxf(*scale_gpu, k_fp8_min_scale);
+	const float inv_scale = 1.0f / scale;
+
+	for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size; idx += blockDim.x * gridDim.x)
+	{
+		float val = __bfloat162float(input_bf16[idx]);
+		if (!isfinite(val))
+		{
+			val = 0.0f;
+		}
+
+		float q = val * inv_scale;
+		q = fminf(fmaxf(q, -fp8_max), fp8_max);
+		const TFP8 q8 = safe_cast_to_fp8<TFP8>(q);
+		output_bf16[idx] = __float2bfloat16(static_cast<float>(q8) * scale);
+	}
+}
+
+void cuda_quantize_f32_to_fp8_and_dequantize_bf16(float *input_f32, size_t size, uint8_t *output_fp8, float *scale_gpu, float *amax_ema_gpu, int fp8_format, int update_scale, float *output_bf16)
+{
+	TAT(TATPARMS);
+
+	if (!input_f32 || !output_bf16 || size == 0)
+	{
+		return;
+	}
+
+	if (!scale_gpu || !amax_ema_gpu)
+	{
+		cuda_convert_f32_to_bf16(input_f32, size, output_bf16);
+		return;
+	}
+
+	const float fp8_max = (fp8_format == 1 ? k_fp8_e5m2_max : k_fp8_e4m3_max);
+	const int blocks = get_number_of_blocks(size, BLOCK);
+	if (update_scale)
+	{
+		CHECK_CUDA(cudaMemsetAsync(scale_gpu, 0, sizeof(float), get_cuda_stream()));
+		fp8_reduce_absmax_kernel<<<blocks, BLOCK, 0, get_cuda_stream()>>>(input_f32, size, scale_gpu);
+		fp8_update_scale_from_amax_kernel<<<1, 1, 0, get_cuda_stream()>>>(scale_gpu, amax_ema_gpu, k_fp8_ema_decay, fp8_max, k_fp8_min_scale);
+	}
+
+	if (fp8_format == 1)
+	{
+		if (output_fp8)
+		{
+			fp8_quantize_scaled_kernel<__nv_fp8_e5m2><<<blocks, BLOCK, 0, get_cuda_stream()>>>(input_f32, size, scale_gpu, fp8_max, (__nv_fp8_e5m2 *)output_fp8);
+			fp8_dequantize_to_bf16_kernel<__nv_fp8_e5m2><<<blocks, BLOCK, 0, get_cuda_stream()>>>((const __nv_fp8_e5m2 *)output_fp8, size, scale_gpu, (__nv_bfloat16 *)output_bf16);
+		}
+		else
+		{
+			fp8_f32_to_bf16_scaled_kernel<__nv_fp8_e5m2><<<blocks, BLOCK, 0, get_cuda_stream()>>>(input_f32, size, scale_gpu, fp8_max, (__nv_bfloat16 *)output_bf16);
+		}
+	}
+	else
+	{
+		if (output_fp8)
+		{
+			fp8_quantize_scaled_kernel<__nv_fp8_e4m3><<<blocks, BLOCK, 0, get_cuda_stream()>>>(input_f32, size, scale_gpu, fp8_max, (__nv_fp8_e4m3 *)output_fp8);
+			fp8_dequantize_to_bf16_kernel<__nv_fp8_e4m3><<<blocks, BLOCK, 0, get_cuda_stream()>>>((const __nv_fp8_e4m3 *)output_fp8, size, scale_gpu, (__nv_bfloat16 *)output_bf16);
+		}
+		else
+		{
+			fp8_f32_to_bf16_scaled_kernel<__nv_fp8_e4m3><<<blocks, BLOCK, 0, get_cuda_stream()>>>(input_f32, size, scale_gpu, fp8_max, (__nv_bfloat16 *)output_bf16);
+		}
+	}
+
+	CHECK_CUDA(cudaPeekAtLastError());
+}
+
+void cuda_quantize_bf16_to_fp8_and_dequantize_bf16(float *input_bf16, size_t size, uint8_t *output_fp8, float *scale_gpu, float *amax_ema_gpu, int fp8_format, int update_scale, float *output_bf16)
+{
+	TAT(TATPARMS);
+
+	if (!input_bf16 || !output_bf16 || size == 0)
+	{
+		return;
+	}
+
+	if (!scale_gpu || !amax_ema_gpu)
+	{
+		CHECK_CUDA(cudaMemcpyAsync(output_bf16, input_bf16, sizeof(__nv_bfloat16) * size, cudaMemcpyDeviceToDevice, get_cuda_stream()));
+		return;
+	}
+
+	const float fp8_max = (fp8_format == 1 ? k_fp8_e5m2_max : k_fp8_e4m3_max);
+	const int blocks = get_number_of_blocks(size, BLOCK);
+	if (update_scale)
+	{
+		CHECK_CUDA(cudaMemsetAsync(scale_gpu, 0, sizeof(float), get_cuda_stream()));
+		fp8_reduce_absmax_bf16_kernel<<<blocks, BLOCK, 0, get_cuda_stream()>>>((const __nv_bfloat16 *)input_bf16, size, scale_gpu);
+		fp8_update_scale_from_amax_kernel<<<1, 1, 0, get_cuda_stream()>>>(scale_gpu, amax_ema_gpu, k_fp8_ema_decay, fp8_max, k_fp8_min_scale);
+	}
+
+	if (fp8_format == 1)
+	{
+		if (output_fp8)
+		{
+			fp8_quantize_bf16_scaled_kernel<__nv_fp8_e5m2><<<blocks, BLOCK, 0, get_cuda_stream()>>>((const __nv_bfloat16 *)input_bf16, size, scale_gpu, fp8_max, (__nv_fp8_e5m2 *)output_fp8);
+			fp8_dequantize_to_bf16_kernel<__nv_fp8_e5m2><<<blocks, BLOCK, 0, get_cuda_stream()>>>((const __nv_fp8_e5m2 *)output_fp8, size, scale_gpu, (__nv_bfloat16 *)output_bf16);
+		}
+		else
+		{
+			fp8_bf16_to_bf16_scaled_kernel<__nv_fp8_e5m2><<<blocks, BLOCK, 0, get_cuda_stream()>>>((const __nv_bfloat16 *)input_bf16, size, scale_gpu, fp8_max, (__nv_bfloat16 *)output_bf16);
+		}
+	}
+	else
+	{
+		if (output_fp8)
+		{
+			fp8_quantize_bf16_scaled_kernel<__nv_fp8_e4m3><<<blocks, BLOCK, 0, get_cuda_stream()>>>((const __nv_bfloat16 *)input_bf16, size, scale_gpu, fp8_max, (__nv_fp8_e4m3 *)output_fp8);
+			fp8_dequantize_to_bf16_kernel<__nv_fp8_e4m3><<<blocks, BLOCK, 0, get_cuda_stream()>>>((const __nv_fp8_e4m3 *)output_fp8, size, scale_gpu, (__nv_bfloat16 *)output_bf16);
+		}
+		else
+		{
+			fp8_bf16_to_bf16_scaled_kernel<__nv_fp8_e4m3><<<blocks, BLOCK, 0, get_cuda_stream()>>>((const __nv_bfloat16 *)input_bf16, size, scale_gpu, fp8_max, (__nv_bfloat16 *)output_bf16);
+		}
+	}
+
+	CHECK_CUDA(cudaPeekAtLastError());
+}
+
+/// Current-scaling quantize kernel: reads the just-computed amax from amax_gpu,
+/// derives the scale inline, then quantizes to FP8 and dequantizes back to BF16.
+/// Eliminates the EMA lag of delayed scaling entirely.
+template<typename TFP8>
+__global__ void fp8_quantize_current_scale_kernel(
+	const float *input_f32, size_t size, const float *amax_gpu,
+	float fp8_max, uint8_t *output_fp8, __nv_bfloat16 *output_bf16)
+{
+	const float scale = fmaxf(*amax_gpu, k_fp8_min_scale);
+	const float inv_scale = 1.0f / scale;
+
+	for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size; idx += blockDim.x * gridDim.x)
+	{
+		float val = input_f32[idx];
+		if (!isfinite(val)) val = 0.0f;
+
+		float q = val * inv_scale;
+		q = fminf(fmaxf(q, -fp8_max), fp8_max);
+		const TFP8 q8 = safe_cast_to_fp8<TFP8>(q);
+		const float dq = static_cast<float>(q8) * scale;
+		output_bf16[idx] = __float2bfloat16(dq);
+
+		if (output_fp8)
+		{
+			output_fp8[idx] = *reinterpret_cast<const uint8_t*>(&q8);
+		}
+	}
+}
+
+template<typename TFP8>
+__global__ void fp8_quantize_current_scale_bf16_kernel(
+	const __nv_bfloat16 *input_bf16, size_t size, const float *amax_gpu,
+	float fp8_max, uint8_t *output_fp8, __nv_bfloat16 *output_bf16)
+{
+	const float scale = fmaxf(*amax_gpu, k_fp8_min_scale);
+	const float inv_scale = 1.0f / scale;
+
+	for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size; idx += blockDim.x * gridDim.x)
+	{
+		float val = __bfloat162float(input_bf16[idx]);
+		if (!isfinite(val)) val = 0.0f;
+
+		float q = val * inv_scale;
+		q = fminf(fmaxf(q, -fp8_max), fp8_max);
+		const TFP8 q8 = safe_cast_to_fp8<TFP8>(q);
+		const float dq = static_cast<float>(q8) * scale;
+		output_bf16[idx] = __float2bfloat16(dq);
+
+		if (output_fp8)
+		{
+			output_fp8[idx] = *reinterpret_cast<const uint8_t*>(&q8);
+		}
+	}
+}
+
+/// Two-pass current scaling: compute amax NOW, then quantize with that amax.
+/// No EMA, no delay — the scale is always computed from the exact tensor being quantized.
+void cuda_fp8_current_scale_quantize_bf16(
+	float *input_f32, size_t size,
+	uint8_t *output_fp8,
+	float *amax_gpu,
+	float *amax_ema_gpu,
+	int fp8_format,
+	float *output_bf16)
+{
+	TAT(TATPARMS);
+
+	if (!input_f32 || !output_bf16 || size == 0)
+	{
+		return;
+	}
+
+	if (!amax_gpu)
+	{
+		cuda_convert_f32_to_bf16(input_f32, size, output_bf16);
+		return;
+	}
+
+	const float fp8_max = (fp8_format == 1 ? k_fp8_e5m2_max : k_fp8_e4m3_max);
+	const int blocks = get_number_of_blocks(size, BLOCK);
+
+	// Pass 1: compute current amax of the tensor
+	CHECK_CUDA(cudaMemsetAsync(amax_gpu, 0, sizeof(float), get_cuda_stream()));
+	fp8_reduce_absmax_kernel<<<blocks, BLOCK, 0, get_cuda_stream()>>>(input_f32, size, amax_gpu);
+	fp8_update_scale_from_amax_kernel<<<1, 1, 0, get_cuda_stream()>>>(amax_gpu, amax_ema_gpu, 0.0f, fp8_max, k_fp8_min_scale);
+
+	// Pass 2: quantize using the just-computed amax (no EMA, no delay)
+	if (fp8_format == 1)
+	{
+		fp8_quantize_current_scale_kernel<__nv_fp8_e5m2><<<blocks, BLOCK, 0, get_cuda_stream()>>>(
+			input_f32, size, amax_gpu, fp8_max, output_fp8, (__nv_bfloat16 *)output_bf16);
+	}
+	else
+	{
+		fp8_quantize_current_scale_kernel<__nv_fp8_e4m3><<<blocks, BLOCK, 0, get_cuda_stream()>>>(
+			input_f32, size, amax_gpu, fp8_max, output_fp8, (__nv_bfloat16 *)output_bf16);
+	}
+
+	CHECK_CUDA(cudaPeekAtLastError());
+}
+
+void cuda_fp8_current_scale_quantize_bf16_from_bf16(
+	float *input_bf16, size_t size,
+	uint8_t *output_fp8,
+	float *amax_gpu,
+	float *amax_ema_gpu,
+	int fp8_format,
+	float *output_bf16)
+{
+	TAT(TATPARMS);
+
+	if (!input_bf16 || !output_bf16 || size == 0)
+	{
+		return;
+	}
+
+	if (!amax_gpu)
+	{
+		CHECK_CUDA(cudaMemcpyAsync(output_bf16, input_bf16, sizeof(__nv_bfloat16) * size, cudaMemcpyDeviceToDevice, get_cuda_stream()));
+		return;
+	}
+
+	const float fp8_max = (fp8_format == 1 ? k_fp8_e5m2_max : k_fp8_e4m3_max);
+	const int blocks = get_number_of_blocks(size, BLOCK);
+
+	CHECK_CUDA(cudaMemsetAsync(amax_gpu, 0, sizeof(float), get_cuda_stream()));
+	fp8_reduce_absmax_bf16_kernel<<<blocks, BLOCK, 0, get_cuda_stream()>>>((const __nv_bfloat16 *)input_bf16, size, amax_gpu);
+	fp8_update_scale_from_amax_kernel<<<1, 1, 0, get_cuda_stream()>>>(amax_gpu, amax_ema_gpu, 0.0f, fp8_max, k_fp8_min_scale);
+
+	if (fp8_format == 1)
+	{
+		fp8_quantize_current_scale_bf16_kernel<__nv_fp8_e5m2><<<blocks, BLOCK, 0, get_cuda_stream()>>>(
+			(const __nv_bfloat16 *)input_bf16, size, amax_gpu, fp8_max, output_fp8, (__nv_bfloat16 *)output_bf16);
+	}
+	else
+	{
+		fp8_quantize_current_scale_bf16_kernel<__nv_fp8_e4m3><<<blocks, BLOCK, 0, get_cuda_stream()>>>(
+			(const __nv_bfloat16 *)input_bf16, size, amax_gpu, fp8_max, output_fp8, (__nv_bfloat16 *)output_bf16);
+	}
+
+	CHECK_CUDA(cudaPeekAtLastError());
+}
+
+void cuda_quantize_f32_to_fp8_bf16_by_policy(
+	float *input_f32, size_t size,
+	uint8_t *output_fp8,
+	float *scale_gpu,
+	float *amax_ema_gpu,
+	int fp8_format,
+	int use_current_scaling,
+	int update_scale,
+	float *output_bf16)
+{
+	TAT(TATPARMS);
+
+	if (use_current_scaling)
+	{
+		cuda_fp8_current_scale_quantize_bf16(input_f32, size, output_fp8, scale_gpu, amax_ema_gpu, fp8_format, output_bf16);
+	}
+	else
+	{
+		cuda_quantize_f32_to_fp8_and_dequantize_bf16(input_f32, size, output_fp8, scale_gpu, amax_ema_gpu, fp8_format, update_scale, output_bf16);
+	}
+}
+
+void cuda_quantize_bf16_to_fp8_bf16_by_policy(
+	float *input_bf16, size_t size,
+	uint8_t *output_fp8,
+	float *scale_gpu,
+	float *amax_ema_gpu,
+	int fp8_format,
+	int use_current_scaling,
+	int update_scale,
+	float *output_bf16)
+{
+	TAT(TATPARMS);
+
+	if (use_current_scaling)
+	{
+		cuda_fp8_current_scale_quantize_bf16_from_bf16(input_bf16, size, output_fp8, scale_gpu, amax_ema_gpu, fp8_format, output_bf16);
+	}
+	else
+	{
+		cuda_quantize_bf16_to_fp8_and_dequantize_bf16(input_bf16, size, output_fp8, scale_gpu, amax_ema_gpu, fp8_format, update_scale, output_bf16);
+	}
+}
+
+__nv_fp8_e4m3 *cuda_make_fp8_from_f32_array(float *src, size_t n)
+{
+	TAT(TATPARMS);
+
+	__nv_fp8_e4m3 *dst8;
+	size_t size = sizeof(__nv_fp8_e4m3) * n;
+	CHECK_CUDA(cudaMalloc((void **)&dst8, size));
+	if (src)
+	{
+		assert(n > 0);
+		cuda_convert_f32_to_fp8(src, n, (float *)dst8);
+	}
+	if (!dst8)
+	{
+		darknet_fatal_error(DARKNET_LOC, "CUDA malloc failed (n=%d)", n);
+	}
+	return dst8;
+}
+#endif
+
+static void reallocate_lowp_tensor(float** ptr, size_t* max_size, size_t required_size, bool is_bf16)
+{
+	if (*max_size < required_size)
+	{
+		*max_size = required_size;
+		if (*ptr) cuda_free(*ptr);
+		assert(*max_size > 0);
+		*ptr = (float*)cuda_make_lowp_from_f32_array(NULL, *max_size, is_bf16);
+	}
+}
+
 void forward_convolutional_layer_gpu(Darknet::Layer & l, Darknet::NetworkState state)
 {
 	TAT(TATPARMS);
@@ -193,6 +1061,23 @@ void forward_convolutional_layer_gpu(Darknet::Layer & l, Darknet::NetworkState s
 	{
 		wait_stream(l.wait_stream_id);
 	}
+
+#ifdef CUDNN
+	int iteration_num = get_current_iteration(state.net); // (*state.net.seen) / (state.net.batch*state.net.subdivisions);
+	const int tensor_cores_min_iteration = std::max(0, state.net.tensor_cores_min_iteration);
+	const bool bf16_compute_mode = (
+		state.net.precision_mode == Darknet::PrecisionMode::BF16 ||
+		state.net.precision_mode == Darknet::PrecisionMode::BF16_MASTER_KAHAN ||
+		state.net.precision_mode == Darknet::PrecisionMode::FP8_BF16 ||
+		state.net.cudnn_bfloat16 || state.net.cudnn_fp8);
+	const bool allow_bf16_tensor_core_now = (!state.train || state.net.loss_scale > 1.0f || iteration_num >= tensor_cores_min_iteration);
+	// cuDNN BF16 convolution is only safe on Tensor Core aligned shapes.
+	const bool tc_aligned = ((l.c / std::max(1, l.groups)) % 8 == 0 && l.n % 8 == 0 && l.groups <= 1);
+	const bool use_lowp_conv = (bf16_compute_mode && allow_bf16_tensor_core_now && tc_aligned);
+#else
+	const bool use_lowp_conv = false;
+#endif
+	ScopedConvolutionalWeightsF32Scratch weights_f32_scratch(l, (l.binary || l.xnor || !use_lowp_conv));
 
 	//fill_ongpu(l.outputs*l.batch, 0, l.output_gpu, 1);
 	if (l.binary)
@@ -268,18 +1153,19 @@ void forward_convolutional_layer_gpu(Darknet::Layer & l, Darknet::NetworkState s
 		state.input = l.binary_input_gpu;
 	}
 
+	bool activation_applied = false;
+	bool cached_bf16_output = false;
+
 	//fill_ongpu(l.outputs*l.batch, 0, l.output_gpu, 1);
 
 #ifdef CUDNN
 	//float one = 1;    // alpha[0], beta[0] is float for HALF and FLOAT
 	float alpha = 1, beta = 0;
-
-//#ifdef CUDNN_HALF
-	//if (state.use_mixed_precision) {
-	int iteration_num = get_current_iteration(state.net); // (*state.net.seen) / (state.net.batch*state.net.subdivisions);
-	if (state.index != 0 && state.net.cudnn_half && !l.xnor && (!state.train || (iteration_num > 3 * state.net.burn_in) && state.net.loss_scale != 1) &&
-		(l.c / l.groups) % 8 == 0 && l.n % 8 == 0 && l.groups <= 1 && l.size > 1)
+	const bool fp8_layer_enabled = (state.net.cudnn_fp8 && l.fp8_enabled > 0);
+	if (use_lowp_conv && !l.xnor)
 	{
+		const bool cache_bf16_output = next_layer_can_consume_cached_bf16_output(state.net, l, state.index, state.train);
+
 		// Note: For improved performance it is advised to use beta[0] = 0.0.
 		// For Tensor Core: cudnnSetConvolutionMathType() where cudnnMathType_t mathType = CUDNN_TENSOR_OP_MATH;
 		// 1. or CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM and use CUDNN_DATA_HALF
@@ -288,75 +1174,165 @@ void forward_convolutional_layer_gpu(Darknet::Layer & l, Darknet::NetworkState s
 
 		const size_t input16_size = l.batch*l.c*l.w*l.h;
 		const size_t output16_size = l.batch*l.out_c*l.out_h*l.out_w;
-
-		if (*state.net.max_input16_size < input16_size)
-		{
-			*state.net.max_input16_size = input16_size;
-			if (*state.net.input16_gpu) cuda_free(*state.net.input16_gpu);
-			assert(*state.net.max_input16_size > 0);
-			*state.net.input16_gpu = (float *)cuda_make_f16_from_f32_array(NULL, *state.net.max_input16_size);
-		}
-		float *input16 = *state.net.input16_gpu;
-
-		if (*state.net.max_output16_size < output16_size) {
-			*state.net.max_output16_size = output16_size;
-			if (*state.net.output16_gpu) cuda_free(*state.net.output16_gpu);
-			assert(*state.net.max_output16_size > 0);
-			*state.net.output16_gpu = (float *)cuda_make_f16_from_f32_array(NULL, *state.net.max_output16_size);
-		}
-		float *output16 = *state.net.output16_gpu;
-
 		assert(input16_size > 0);
-		cuda_convert_f32_to_f16(state.input, input16_size, input16);
+		// fp8_update_scale_now is needed by the FP8 input-quantization path inside the else block below.
+		const int fp8_scale_update_interval = std::max(1, state.net.fp8_scale_update_interval);
+		const int64_t lowp_step = static_cast<int64_t>(get_current_iteration(state.net)) * std::max(1, state.net.subdivisions) + std::max(0, state.net.current_subdivision);
+		const int fp8_update_scale_now = ((lowp_step % fp8_scale_update_interval) == 0 ? 1 : 0);
 
-		CHECK_CUDNN(cudnnConvolutionForward(cudnn_handle(),
-			&alpha,
-			l.srcTensorDesc16,
-			input16,
-			l.weightDesc16,
-			l.weights_gpu16,
-			l.convDesc,
-			l.fw_algo16,
-			state.workspace,
-			l.workspace_size,
-			&beta,
-			l.dstTensorDesc16,
-			output16));
-
-
-		if (l.batch_normalize)
+		// When state.input is already BF16 (from the previous layer's output_gpu16),
+		// use it directly — no allocation or conversion needed.
+		// FP8 path still needs FP32 input for quantization, so it always converts.
+		float *input16;
+		if (state.input_is_bf16 && !fp8_layer_enabled)
 		{
-			if (state.train && !state.net.adversarial) // Training
-			{
-				simple_copy_ongpu(l.outputs*l.batch / 2, output16, l.x_gpu);
-				float one = 1.0f;
-				float zero = 0.0f;
-				// Batch-normalization can still take FP16 inputs and outputs, saving half the bandwidth
-				// compared to FP32, it's just that the statistics and value adjustment should be done in FP32.
-				CHECK_CUDNN(cudnnBatchNormalizationForwardTraining(cudnn_handle(),
-					CUDNN_BATCHNORM_SPATIAL,
-					&one,
-					&zero,
-					l.normDstTensorDescF16,
-					l.x_gpu,            // input
-					l.normDstTensorDescF16,
-					output16,            // output
-					l.normTensorDesc,
-					l.scales_gpu,       // input
-					l.biases_gpu,       // input
-					.01,
-					l.rolling_mean_gpu,        // input/output (should be FP32)
-					l.rolling_variance_gpu,    // input/output (should be FP32)
-					.00001,
-					l.mean_gpu,            // output (should be FP32) - optional cache to speedup cudnnBatchNormalizationBackward()
-					l.variance_gpu));    // output (should be FP32) - optional cache to speedup cudnnBatchNormalizationBackward()
+			input16 = state.input; // zero-copy: already BF16 from prev layer's output_gpu16
+		}
+		else
+		{
+			reallocate_lowp_tensor(state.net.input16_gpu, state.net.max_input16_size, input16_size, bf16_compute_mode);
+			input16 = *state.net.input16_gpu;
 
-				cuda_convert_f16_to_f32(output16, output16_size, l.output_gpu);
-				//forward_batchnorm_layer_gpu(l, state);
+			assert(input16_size > 0);
+#if defined(DARKNET_GPU_CUDA) && (CUDART_VERSION >= 12000)
+			if (fp8_layer_enabled)
+			{
+				if (state.input_is_bf16)
+				{
+					cuda_quantize_bf16_to_fp8_bf16_by_policy(
+						state.input, input16_size,
+						(uint8_t *)l.act_fp8_gpu,
+						l.x_scale_gpu,
+						l.x_amax_ema_gpu,
+						l.fp8_format,
+						state.net.fp8_current_scaling,
+						fp8_update_scale_now,
+						input16);
+				}
+				else
+				{
+					cuda_quantize_f32_to_fp8_bf16_by_policy(
+						state.input, input16_size,
+						(uint8_t *)l.act_fp8_gpu,
+						l.x_scale_gpu,
+						l.x_amax_ema_gpu,
+						l.fp8_format,
+						state.net.fp8_current_scaling,
+						fp8_update_scale_now,
+						input16);
+				}
+
+				if (state.net.fp8_debug && (get_current_iteration(state.net) % 100 == 0))
+				{
+					float x_metric = 0.0f, w_metric = 0.0f;
+					float x_aux = 0.0f, w_aux = 0.0f;
+					CHECK_CUDA(cudaMemcpyAsync(&x_metric, l.x_scale_gpu, sizeof(float), cudaMemcpyDeviceToHost, get_cuda_stream()));
+					CHECK_CUDA(cudaMemcpyAsync(&w_metric, l.w_scale_gpu, sizeof(float), cudaMemcpyDeviceToHost, get_cuda_stream()));
+					if (!state.net.fp8_current_scaling)
+					{
+						CHECK_CUDA(cudaMemcpyAsync(&x_aux, l.x_amax_ema_gpu, sizeof(float), cudaMemcpyDeviceToHost, get_cuda_stream()));
+						CHECK_CUDA(cudaMemcpyAsync(&w_aux, l.w_amax_ema_gpu, sizeof(float), cudaMemcpyDeviceToHost, get_cuda_stream()));
+					}
+					CHECK_CUDA(cudaStreamSynchronize(get_cuda_stream()));
+					const float fp8_max = (l.fp8_format == 1 ? k_fp8_e5m2_max : k_fp8_e4m3_max);
+					if (state.net.fp8_current_scaling)
+					{
+						printf("[FP8 Debug] Layer %d: x_amax=%.4f w_amax=%.4f x_scale=%.6f w_scale=%.6f (current)\n",
+							l.index, x_metric, w_metric,
+							fmaxf(x_metric / fp8_max, k_fp8_min_scale),
+							fmaxf(w_metric / fp8_max, k_fp8_min_scale));
+					}
+					else
+					{
+						printf("[FP8 Debug] Layer %d: x_amax_ema=%.4f w_amax_ema=%.4f x_scale=%.6f w_scale=%.6f (delayed)\n",
+							l.index, x_aux, w_aux, x_metric, w_metric);
+					}
+				}
+			}
+			else
+#endif
+			{
+				cuda_convert_f32_to_lowp(state.input, input16_size, input16, bf16_compute_mode);
+			}
+		}
+
+		reallocate_lowp_tensor(state.net.output16_gpu, state.net.max_output16_size, output16_size, bf16_compute_mode);
+		float *output16 = *state.net.output16_gpu;
+		float *conv_weights16 = get_lowp_convolution_weights_gpu16(l, fp8_layer_enabled);
+
+			const auto cudnn_status = cudnnConvolutionForward(cudnn_handle(),
+				&alpha,
+				l.srcTensorDesc16,
+				input16,
+				l.weightDesc16,
+				conv_weights16,
+				l.convDesc,
+				l.fw_algo16,
+				state.workspace,
+				l.workspace_size,
+				&beta,
+				l.dstTensorDesc16,
+				output16);
+			if (cudnn_status != CUDNN_STATUS_SUCCESS)
+			{
+				*cfg_and_state.output
+					<< "BF16 forward failure: layer=" << l.index
+					<< ", c=" << l.c
+					<< ", n=" << l.n
+					<< ", groups=" << l.groups
+					<< ", size=" << l.size
+					<< ", w=" << l.w
+					<< ", h=" << l.h
+					<< ", out_w=" << l.out_w
+					<< ", out_h=" << l.out_h
+					<< ", tc_aligned=" << tc_aligned
+					<< ", workspace=" << l.workspace_size
+					<< std::endl;
+			}
+			CHECK_CUDNN(cudnn_status);
+
+			if (l.batch_normalize)
+			{
+				if (state.train && !state.net.adversarial) // Training
+				{
+					simple_copy_ongpu(l.outputs*l.batch / 2, output16, l.x_gpu);
+					float one = 1.0f;
+					float zero = 0.0f;
+					// Batch-normalization can still take FP16/BF16 inputs and outputs, saving bandwidth,
+					// while statistics and scaling remain in FP32.
+					CHECK_CUDNN(cudnnBatchNormalizationForwardTraining(cudnn_handle(),
+						CUDNN_BATCHNORM_SPATIAL,
+						&one,
+						&zero,
+						l.normDstTensorDescF16,
+						l.x_gpu,            // input
+						l.normDstTensorDescF16,
+						output16,            // output
+						l.normTensorDesc,
+						l.scales_gpu,       // input
+						l.biases_gpu,       // input
+						.01,
+						l.rolling_mean_gpu,        // input/output (should be FP32)
+						l.rolling_variance_gpu,    // input/output (should be FP32)
+						.00001,
+						l.mean_gpu,            // output (should be FP32) - optional cache to speedup cudnnBatchNormalizationBackward()
+						l.variance_gpu));    // output (should be FP32) - optional cache to speedup cudnnBatchNormalizationBackward()
+
+#if defined(DARKNET_GPU_CUDA) && (CUDART_VERSION >= 11000)
+					if (can_materialize_post_activation_bf16_cache(state.net, l, cache_bf16_output))
+					{
+						activate_array_bf16_ongpu(output16, output16_size, l.activation);
+						CHECK_CUDA(cudaMemcpyAsync(l.output_gpu16, output16, sizeof(__nv_bfloat16) * output16_size, cudaMemcpyDeviceToDevice, get_cuda_stream()));
+						activation_applied = true;
+						cached_bf16_output = true;
+					}
+#endif
+
+					cuda_convert_lowp_to_f32(output16, output16_size, l.output_gpu, bf16_compute_mode);
 			}
 			else // Detection
 			{
-				cuda_convert_f16_to_f32(output16, output16_size, l.output_gpu);
+				cuda_convert_lowp_to_f32(output16, output16_size, l.output_gpu, bf16_compute_mode);
 				normalize_gpu(l.output_gpu, l.rolling_mean_gpu, l.rolling_variance_gpu, l.batch, l.out_c, l.out_h*l.out_w);
 				scale_bias_gpu(l.output_gpu, l.scales_gpu, l.batch, l.out_c, l.out_h*l.out_w);
 				add_bias_gpu(l.output_gpu, l.biases_gpu, l.batch, l.out_c, l.out_w*l.out_h);
@@ -364,9 +1340,23 @@ void forward_convolutional_layer_gpu(Darknet::Layer & l, Darknet::NetworkState s
 		}
 		else // BIAS only
 		{
-			cuda_convert_f16_to_f32(output16, output16_size, l.output_gpu);
-			add_bias_gpu(l.output_gpu, l.biases_gpu, l.batch, l.n, l.out_w*l.out_h);
+#if defined(DARKNET_GPU_CUDA) && (CUDART_VERSION >= 11000)
+			if ((state.net.cudnn_bfloat16 || state.net.cudnn_fp8) && can_materialize_post_activation_bf16_cache(state.net, l, cache_bf16_output))
+			{
+				add_bias_activate_bf16_ongpu(output16, l.biases_gpu, l.batch, l.n, l.out_w*l.out_h, l.activation);
+				CHECK_CUDA(cudaMemcpyAsync(l.output_gpu16, output16, sizeof(__nv_bfloat16) * output16_size, cudaMemcpyDeviceToDevice, get_cuda_stream()));
+				activation_applied = true;
+				cached_bf16_output = true;
+				cuda_convert_lowp_to_f32(output16, output16_size, l.output_gpu, true);
+			}
+			else
+#endif
+			{
+				cuda_convert_lowp_to_f32(output16, output16_size, l.output_gpu, bf16_compute_mode);
+				add_bias_gpu(l.output_gpu, l.biases_gpu, l.batch, l.n, l.out_w*l.out_h);
+			}
 		}
+
 	}
 	else
 	{
@@ -448,13 +1438,16 @@ void forward_convolutional_layer_gpu(Darknet::Layer & l, Darknet::NetworkState s
 //#ifndef CUDNN_HALF
 //#endif // no CUDNN_HALF
 
-	if (l.activation == SWISH) activate_array_swish_ongpu(l.output_gpu, l.outputs*l.batch, l.activation_input_gpu, l.output_gpu);
-	else if (l.activation == MISH) activate_array_mish_ongpu(l.output_gpu, l.outputs*l.batch, l.activation_input_gpu, l.output_gpu);
-	else if (l.activation == HARD_MISH) activate_array_hard_mish_ongpu(l.output_gpu, l.outputs*l.batch, l.activation_input_gpu, l.output_gpu);
-	else if (l.activation == NORM_CHAN) activate_array_normalize_channels_ongpu(l.output_gpu, l.outputs*l.batch, l.batch, l.out_c, l.out_w*l.out_h, l.output_gpu);
-	else if (l.activation == NORM_CHAN_SOFTMAX) activate_array_normalize_channels_softmax_ongpu(l.output_gpu, l.outputs*l.batch, l.batch, l.out_c, l.out_w*l.out_h, l.output_gpu, 0);
-	else if (l.activation == NORM_CHAN_SOFTMAX_MAXVAL) activate_array_normalize_channels_softmax_ongpu(l.output_gpu, l.outputs*l.batch, l.batch, l.out_c, l.out_w*l.out_h, l.output_gpu, 1);
-	else if (l.activation != LINEAR) activate_array_ongpu(l.output_gpu, l.outputs*l.batch, l.activation);
+	if (!activation_applied)
+	{
+		if (l.activation == SWISH) activate_array_swish_ongpu(l.output_gpu, l.outputs*l.batch, l.activation_input_gpu, l.output_gpu);
+		else if (l.activation == MISH) activate_array_mish_ongpu(l.output_gpu, l.outputs*l.batch, l.activation_input_gpu, l.output_gpu);
+		else if (l.activation == HARD_MISH) activate_array_hard_mish_ongpu(l.output_gpu, l.outputs*l.batch, l.activation_input_gpu, l.output_gpu);
+		else if (l.activation == NORM_CHAN) activate_array_normalize_channels_ongpu(l.output_gpu, l.outputs*l.batch, l.batch, l.out_c, l.out_w*l.out_h, l.output_gpu);
+		else if (l.activation == NORM_CHAN_SOFTMAX) activate_array_normalize_channels_softmax_ongpu(l.output_gpu, l.outputs*l.batch, l.batch, l.out_c, l.out_w*l.out_h, l.output_gpu, 0);
+		else if (l.activation == NORM_CHAN_SOFTMAX_MAXVAL) activate_array_normalize_channels_softmax_ongpu(l.output_gpu, l.outputs*l.batch, l.batch, l.out_c, l.out_w*l.out_h, l.output_gpu, 1);
+		else if (l.activation != LINEAR) activate_array_ongpu(l.output_gpu, l.outputs*l.batch, l.activation);
+	}
 	//if(l.dot > 0) dot_error_gpu(l);
 	if(l.binary || l.xnor) swap_binary(&l);
 	//cudaDeviceSynchronize();    // for correct profiling of performance
@@ -486,6 +1479,12 @@ void forward_convolutional_layer_gpu(Darknet::Layer & l, Darknet::NetworkState s
 	{
 		coord_conv_gpu(l.output_gpu, l.outputs*l.batch, l.out_w, l.out_h, l.out_c, l.batch, 0);
 	}
+
+	if (!cached_bf16_output && next_layer_can_consume_cached_bf16_output(state.net, l, state.index, state.train))
+	{
+		cuda_convert_f32_to_lowp(l.output_gpu, l.outputs*l.batch, l.output_gpu16, true);
+	}
+
 }
 
 
@@ -532,41 +1531,96 @@ void backward_convolutional_layer_gpu(Darknet::Layer & l, Darknet::NetworkState 
 //#endif // no CUDNN_HALF
 	float *original_input = state.input;
 
+#ifdef CUDNN
+	int iteration_num = get_current_iteration(state.net); //(*state.net.seen) / (state.net.batch*state.net.subdivisions);
+	const int tensor_cores_min_iteration = std::max(0, state.net.tensor_cores_min_iteration);
+	const bool bf16_compute_mode = (
+		state.net.precision_mode == Darknet::PrecisionMode::BF16 ||
+		state.net.precision_mode == Darknet::PrecisionMode::BF16_MASTER_KAHAN ||
+		state.net.precision_mode == Darknet::PrecisionMode::FP8_BF16 ||
+		state.net.cudnn_bfloat16 || state.net.cudnn_fp8);
+	const bool allow_bf16_tensor_core_now = (!state.train || state.net.loss_scale > 1.0f || iteration_num >= tensor_cores_min_iteration);
+	const bool tc_aligned = ((l.c / std::max(1, l.groups)) % 8 == 0 && l.n % 8 == 0 && l.groups <= 1);
+	const bool use_lowp_conv = (bf16_compute_mode && allow_bf16_tensor_core_now && tc_aligned);
+#else
+	const bool use_lowp_conv = false;
+#endif
+	ScopedConvolutionalWeightsF32Scratch weights_f32_scratch(l, (l.binary || l.xnor || !use_lowp_conv));
+
 	if(l.xnor) state.input = l.binary_input_gpu;
 #ifdef CUDNN
 	float alpha = 1.0f;
 	float beta = 0.0f;
+	const bool fp8_layer_enabled = (state.net.cudnn_fp8 && l.fp8_enabled > 0);
 
-//#ifdef CUDNN_HALF
-	int iteration_num = get_current_iteration(state.net); //(*state.net.seen) / (state.net.batch*state.net.subdivisions);
-	if (state.index != 0 && state.net.cudnn_half && !l.xnor && (!state.train || (iteration_num > 3 * state.net.burn_in) && state.net.loss_scale != 1) &&
-		(l.c / l.groups) % 8 == 0 && l.n % 8 == 0  && l.groups <= 1 && l.size > 1)
+	if (use_lowp_conv && !l.xnor)
 	{
 		const size_t input16_size = l.batch*l.c*l.w*l.h;
 		const size_t delta16_size = l.batch*l.n*l.out_w*l.out_h;
 
-		if (*state.net.max_input16_size < input16_size)
+		float *input16;
+		if (state.input_is_bf16 && !fp8_layer_enabled)
 		{
-			*state.net.max_input16_size = input16_size;
-			if (*state.net.input16_gpu) cuda_free(*state.net.input16_gpu);
-			assert(*state.net.max_input16_size > 0);
-			*state.net.input16_gpu = (float *)cuda_make_f16_from_f32_array(NULL, *state.net.max_input16_size);
+			input16 = state.input; // zero-copy: already BF16 from prev layer's output_gpu16
 		}
-		float *input16 = *state.net.input16_gpu;
+		else
+		{
+			reallocate_lowp_tensor(state.net.input16_gpu, state.net.max_input16_size, input16_size, bf16_compute_mode);
+			input16 = *state.net.input16_gpu;
+		}
 
-		if (*state.net.max_output16_size < delta16_size)
-		{
-			*state.net.max_output16_size = delta16_size;
-			if (*state.net.output16_gpu) cuda_free(*state.net.output16_gpu);
-			assert(*state.net.max_output16_size > 0);
-			*state.net.output16_gpu = (float *)cuda_make_f16_from_f32_array(NULL, *state.net.max_output16_size);
-		}
+		reallocate_lowp_tensor(state.net.output16_gpu, state.net.max_output16_size, delta16_size, bf16_compute_mode);
 		float *delta16 = *state.net.output16_gpu;
 
 		assert(input16_size > 0);
 		assert(delta16_size > 0);
-		cuda_convert_f32_to_f16(state.input, input16_size, input16);
-		cuda_convert_f32_to_f16(l.delta_gpu, delta16_size, delta16);
+		const int fp8_scale_update_interval = std::max(1, state.net.fp8_scale_update_interval);
+		const int64_t lowp_step = static_cast<int64_t>(get_current_iteration(state.net)) * std::max(1, state.net.subdivisions) + std::max(0, state.net.current_subdivision);
+		const int fp8_update_scale_now = ((lowp_step % fp8_scale_update_interval) == 0 ? 1 : 0);
+#if defined(DARKNET_GPU_CUDA) && (CUDART_VERSION >= 12000)
+		if (fp8_layer_enabled)
+		{
+			if (state.input_is_bf16)
+			{
+				cuda_quantize_bf16_to_fp8_bf16_by_policy(
+					state.input, input16_size,
+					(uint8_t *)l.act_fp8_gpu,
+					l.x_scale_gpu,
+					l.x_amax_ema_gpu,
+					0 /* E4M3 */,
+					state.net.fp8_current_scaling,
+					fp8_update_scale_now,
+					input16);
+			}
+			else
+			{
+				cuda_quantize_f32_to_fp8_bf16_by_policy(
+					state.input, input16_size,
+					(uint8_t *)l.act_fp8_gpu,
+					l.x_scale_gpu,
+					l.x_amax_ema_gpu,
+					0 /* E4M3 */,
+					state.net.fp8_current_scaling,
+					fp8_update_scale_now,
+					input16);
+			}
+			cuda_quantize_f32_to_fp8_bf16_by_policy(
+				l.delta_gpu, delta16_size,
+				NULL,
+				l.grad_scale_gpu,
+				l.grad_amax_ema_gpu,
+				1 /* E5M2 */,
+				state.net.fp8_current_scaling,
+				fp8_update_scale_now,
+				delta16);
+		}
+		else
+#endif
+		{
+			if (!state.input_is_bf16 || fp8_layer_enabled)
+				cuda_convert_f32_to_lowp(state.input, input16_size, input16, bf16_compute_mode);
+			cuda_convert_f32_to_lowp(l.delta_gpu, delta16_size, delta16, bf16_compute_mode);
+		}
 
 		if (l.batch_normalize)
 		{
@@ -602,7 +1656,7 @@ void backward_convolutional_layer_gpu(Darknet::Layer & l, Darknet::NetworkState 
 		// Already: l.weight_updates_gpu = (l.weight_updates_gpu - l.weight*decay*batch*subdivision)*momentum
 		//   so we should copy f32 to f16, or compute: f16=(w_up - w*d*b*s)*m
 		assert((l.nweights) > 0);
-		cuda_convert_f32_to_f16(l.weight_updates_gpu, l.nweights, l.weight_updates_gpu16);
+		cuda_convert_f32_to_lowp(l.weight_updates_gpu, l.nweights, l.weight_updates_gpu16, bf16_compute_mode);
 
 		float one = 1.0f;
 		if (!state.net.adversarial && !l.train_only_bn)
@@ -621,7 +1675,7 @@ void backward_convolutional_layer_gpu(Darknet::Layer & l, Darknet::NetworkState 
 				l.dweightDesc16,
 				l.weight_updates_gpu16));    // l.weight_updates_gpu);
 
-			cuda_convert_f16_to_f32(l.weight_updates_gpu16, l.nweights, l.weight_updates_gpu);
+			cuda_convert_lowp_to_f32(l.weight_updates_gpu16, l.nweights, l.weight_updates_gpu, bf16_compute_mode);
 		}
 
 		if (state.delta)
@@ -635,7 +1689,7 @@ void backward_convolutional_layer_gpu(Darknet::Layer & l, Darknet::NetworkState 
 			CHECK_CUDNN(cudnnConvolutionBackwardData(cudnn_handle(),
 				&alpha,
 				l.weightDesc16,
-				l.weights_gpu16, //l.weights_gpu,
+				get_lowp_convolution_weights_gpu16(l, fp8_layer_enabled), //l.weights_gpu,
 				l.ddstTensorDesc16,
 				delta16, //l.delta_gpu,
 				l.convDesc,
@@ -646,7 +1700,7 @@ void backward_convolutional_layer_gpu(Darknet::Layer & l, Darknet::NetworkState 
 				l.dsrcTensorDesc16,
 				input16));    // state.delta);
 
-			cuda_convert_f16_to_f32(input16, input16_size, state.delta);
+			cuda_convert_lowp_to_f32(input16, input16_size, state.delta, bf16_compute_mode);
 
 			if (l.binary || l.xnor) swap_binary(&l);
 			if (l.xnor) gradient_array_ongpu(original_input, l.batch*l.c*l.h*l.w, HARDTAN, state.delta);
@@ -795,7 +1849,7 @@ void backward_convolutional_layer_gpu(Darknet::Layer & l, Darknet::NetworkState 
 		}
 		int size = l.nweights;
 		reset_nan_and_inf(l.weight_updates_gpu, size);
-		fix_nan_and_inf(l.weights_gpu, size);
+		if (!use_bf16_master_weight_storage(l) && l.weights_gpu) fix_nan_and_inf(l.weights_gpu, size);
 	}
 
 
@@ -980,6 +2034,7 @@ void pull_convolutional_layer(Darknet::Layer & l)
 {
 	TAT(TATPARMS);
 
+	ScopedConvolutionalWeightsF32Scratch weights_f32_scratch(l, use_bf16_master_weight_storage(l));
 	cuda_pull_array_async(l.weights_gpu, l.weights, l.nweights);
 	cuda_pull_array_async(l.biases_gpu, l.biases, l.n);
 	if (l.weight_updates_gpu) cuda_pull_array_async(l.weight_updates_gpu, l.weight_updates, l.nweights);
@@ -1001,10 +2056,50 @@ void push_convolutional_layer(Darknet::Layer & l)
 {
 	TAT(TATPARMS);
 
-	cuda_push_array(l.weights_gpu, l.weights, l.nweights);
+	if (use_bf16_master_weight_storage(l))
+	{
+		float *weights_gpu_tmp = cuda_make_array(l.weights, l.nweights);
+		cuda_convert_f32_to_lowp(weights_gpu_tmp, l.nweights, l.weights_gpu16, true);
+#if defined(DARKNET_GPU_CUDA) && (CUDART_VERSION >= 12000)
+		if (cfg_and_state.use_cudnn_fp8 && l.fp8_enabled > 0 && l.weights_conv_gpu16)
+		{
+			cuda_quantize_bf16_to_fp8_bf16_by_policy(
+				l.weights_gpu16, l.nweights,
+				l.weights_fp8_gpu,
+				l.w_scale_gpu,
+				l.w_amax_ema_gpu,
+				l.fp8_format,
+				1,
+				1,
+				l.weights_conv_gpu16);
+		}
+#endif
+		cuda_free(weights_gpu_tmp);
+	}
+	else
+	{
+		cuda_push_array(l.weights_gpu, l.weights, l.nweights);
 #ifdef CUDNN_HALF
-	assert(l.nweights > 0);
-	cuda_convert_f32_to_f16(l.weights_gpu, l.nweights, l.weights_gpu16);
+		assert(l.nweights > 0);
+#if defined(DARKNET_GPU_CUDA) && (CUDART_VERSION >= 12000)
+		if (cfg_and_state.use_cudnn_fp8 && l.fp8_enabled > 0)
+		{
+			float *dst16 = (l.weights_conv_gpu16 ? l.weights_conv_gpu16 : l.weights_gpu16);
+			cuda_quantize_f32_to_fp8_bf16_by_policy(l.weights_gpu, l.nweights, l.weights_fp8_gpu, l.w_scale_gpu, l.w_amax_ema_gpu, l.fp8_format, 1, 1, dst16);
+		}
+		else
+#endif
+		{
+			const bool is_bf16 = (cfg_and_state.use_cudnn_bf16 || cfg_and_state.use_cudnn_fp8);
+			cuda_convert_f32_to_lowp(l.weights_gpu, l.nweights, l.weights_gpu16, is_bf16);
+		}
+#endif
+	}
+#if defined(DARKNET_GPU_CUDA) && (CUDNN_MAJOR >= 8) && (CUDART_VERSION >= 11000)
+	if (l.weight_compensation_gpu)
+	{
+		CHECK_CUDA(cudaMemsetAsync(l.weight_compensation_gpu, 0, sizeof(float) * (l.nweights / 2 + 1), get_cuda_stream()));
+	}
 #endif
 	cuda_push_array(l.biases_gpu, l.biases, l.n);
 	if (l.train) {
@@ -1039,9 +2134,12 @@ void update_convolutional_layer_gpu(Darknet::Layer & l, int batch, float learnin
 
 	// Loss scale for Mixed-Precision on Tensor-Cores
 	float learning_rate = learning_rate_init*l.learning_rate_scale / loss_scale;
+	const bool bf16_master_weights = use_bf16_master_weight_storage(l);
+	const bool needs_f32_weight_ops = (l.adam || l.deform || l.clip || l.reverse || !l.weight_compensation_gpu);
+	ScopedConvolutionalWeightsF32Scratch weights_f32_scratch(l, needs_f32_weight_ops);
 
 	reset_nan_and_inf(l.weight_updates_gpu, l.nweights);
-	fix_nan_and_inf(l.weights_gpu, l.nweights);
+	if (l.weights_gpu) fix_nan_and_inf(l.weights_gpu, l.nweights);
 
 	// Gradient Centralization
 	if (l.grad_centr && l.batch_normalize)
@@ -1072,12 +2170,22 @@ void update_convolutional_layer_gpu(Darknet::Layer & l, int batch, float learnin
 			l.weight_updates_gpu = l.output_gpu;
 		}
 
-		axpy_ongpu(l.nweights, -decay*batch*loss_scale, l.weights_gpu, 1, l.weight_updates_gpu, 1);
-		axpy_ongpu(l.nweights, learning_rate / batch, l.weight_updates_gpu, 1, l.weights_gpu, 1);
+#if defined(DARKNET_GPU_CUDA) && (CUDNN_MAJOR >= 8) && (CUDART_VERSION >= 11000)
+		if (bf16_master_weights && l.weight_compensation_gpu && !l.reverse && !weights_f32_scratch.active())
+		{
+			cuda_bf16_kahan_sgd(l.nweights, learning_rate / batch, -decay * batch * loss_scale, momentum,
+				l.weight_updates_gpu, l.weights_gpu16, l.weight_compensation_gpu, nullptr);
+		}
+		else
+#endif
+		{
+			axpy_ongpu(l.nweights, -decay*batch*loss_scale, l.weights_gpu, 1, l.weight_updates_gpu, 1);
+			axpy_ongpu(l.nweights, learning_rate / batch, l.weight_updates_gpu, 1, l.weights_gpu, 1);
 
-		l.weight_updates_gpu = old_weight_updates_gpu;
+			l.weight_updates_gpu = old_weight_updates_gpu;
 
-		scal_ongpu(l.nweights, momentum, l.weight_updates_gpu, 1);
+			scal_ongpu(l.nweights, momentum, l.weight_updates_gpu, 1);
+		}
 
 		axpy_ongpu(l.n, learning_rate / batch, l.bias_updates_gpu, 1, l.biases_gpu, 1);
 		scal_ongpu(l.n, momentum, l.bias_updates_gpu, 1);
@@ -1102,4 +2210,22 @@ void update_convolutional_layer_gpu(Darknet::Layer & l, int batch, float learnin
 	{
 		constrain_ongpu(l.nweights, l.clip, l.weights_gpu, 1);
 	}
+
+	// BF16 master weights: commit the FP32 mirror only when the fused Kahan path
+	// did not already write the authoritative BF16 weights.
+#if defined(DARKNET_GPU_CUDA) && (CUDNN_MAJOR >= 8) && (CUDART_VERSION >= 11000)
+	if (bf16_master_weights && l.weights_gpu16 && weights_f32_scratch.active())
+	{
+		if (l.weight_compensation_gpu)	cuda_bf16_kahan_commit(l.nweights, l.weights_gpu, l.weights_gpu16, l.weight_compensation_gpu);
+		else							cuda_convert_f32_to_lowp(l.weights_gpu, l.nweights, l.weights_gpu16, true);
+	}
+#endif
+
+#if defined(DARKNET_GPU_CUDA) && (CUDART_VERSION >= 12000)
+	if (l.fp8_enabled > 0 && (l.weights_conv_gpu16 || l.weights_gpu16))
+	{
+		float *dst16 = (l.weights_conv_gpu16 ? l.weights_conv_gpu16 : l.weights_gpu16);
+		cuda_quantize_f32_to_fp8_bf16_by_policy(l.weights_gpu, l.nweights, l.weights_fp8_gpu, l.w_scale_gpu, l.w_amax_ema_gpu, l.fp8_format, 1, 1, dst16);
+	}
+#endif
 }

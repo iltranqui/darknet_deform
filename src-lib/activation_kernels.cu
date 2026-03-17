@@ -1,5 +1,8 @@
 #include "darknet_internal.hpp"
 #include "darknet_gpu.hpp"
+#if defined(DARKNET_GPU_CUDA) && (CUDART_VERSION >= 11000)
+#include <cuda_bf16.h>
+#endif
 
 __device__ float lhtan_activate_kernel(float x)
 {
@@ -167,6 +170,27 @@ __device__ float gradient_kernel(float x, ACTIVATION a)
 	}
 	return 0;
 }
+
+#if defined(DARKNET_GPU_CUDA) && (CUDART_VERSION >= 11000)
+__global__ void activate_array_bf16_kernel(__nv_bfloat16 *x, int n, ACTIVATION a)
+{
+	int i = (blockIdx.x + blockIdx.y*gridDim.x) * blockDim.x + threadIdx.x;
+	if (i < n)
+	{
+		x[i] = __float2bfloat16(activate_kernel(__bfloat162float(x[i]), a));
+	}
+}
+
+__global__ void add_bias_activate_bf16_kernel(__nv_bfloat16 *output, const float *biases, int filters, int spatial, int current_size, ACTIVATION a)
+{
+	const int index = blockIdx.x*blockDim.x + threadIdx.x;
+	if (index >= current_size) return;
+
+	const int f = (index / spatial) % filters;
+	const float value = __bfloat162float(output[index]) + biases[f];
+	output[index] = __float2bfloat16(activate_kernel(value, a));
+}
+#endif
 
 __global__ void binary_gradient_array_kernel(float *x, float *dy, int n, int s, BINARY_ACTIVATION a, float *dx)
 {
@@ -513,6 +537,63 @@ void activate_array_ongpu(float *x, int n, ACTIVATION a)
 		activate_array_kernel<<<cuda_gridsize(n), BLOCK, 0, get_cuda_stream()>>>(x, n, a);
 	CHECK_CUDA(cudaPeekAtLastError());
 }
+
+#if defined(DARKNET_GPU_CUDA) && (CUDART_VERSION >= 11000)
+bool can_activate_array_bf16_ongpu(ACTIVATION a)
+{
+	switch (a)
+	{
+		case LINEAR:
+		case LOGISTIC:
+		case LOGGY:
+		case RELU:
+		case RELU6:
+		case ELU:
+		case SELU:
+		case GELU:
+		case RELIE:
+		case RAMP:
+		case LEAKY:
+		case TANH:
+		case PLSE:
+		case STAIR:
+		case HARDTAN:
+		case LHTAN:
+			return true;
+
+		default:
+			return false;
+	}
+}
+
+void activate_array_bf16_ongpu(float *x_bf16, int n, ACTIVATION a)
+{
+	TAT(TATPARMS);
+
+	if (!can_activate_array_bf16_ongpu(a) || a == LINEAR)
+	{
+		return;
+	}
+
+	activate_array_bf16_kernel<<<cuda_gridsize(n), BLOCK, 0, get_cuda_stream()>>>((__nv_bfloat16 *)x_bf16, n, a);
+	CHECK_CUDA(cudaPeekAtLastError());
+}
+
+void add_bias_activate_bf16_ongpu(float *output_bf16, float *biases, int batch, int filters, int spatial, ACTIVATION a)
+{
+	TAT(TATPARMS);
+
+	if (!can_activate_array_bf16_ongpu(a))
+	{
+		return;
+	}
+
+	const int current_size = batch * filters * spatial;
+	const int num_blocks = get_number_of_blocks(current_size, BLOCK);
+	add_bias_activate_bf16_kernel<<<num_blocks, BLOCK, 0, get_cuda_stream()>>>((__nv_bfloat16 *)output_bf16, biases, filters, spatial, current_size, a);
+	CHECK_CUDA(cudaPeekAtLastError());
+}
+#endif
 
 void activate_array_swish_ongpu(float *x, int n, float *output_sigmoid_gpu, float *output_gpu)
 {

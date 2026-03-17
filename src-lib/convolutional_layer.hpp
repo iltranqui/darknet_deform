@@ -16,6 +16,28 @@ void backward_bias_gpu(float *bias_updates, float *delta, int batch, int n, int 
 void cudnn_convolutional_setup(Darknet::Layer *l, int cudnn_preference, size_t workspace_size_specify);
 void create_convolutional_cudnn_tensors(Darknet::Layer *l);
 void cuda_convert_f32_to_f16(float* input_f32, size_t size, float *output_f16);
+void cuda_convert_f16_to_f32(float* input_f16, size_t size, float *output_f32);
+#if defined(DARKNET_GPU_CUDA) && (CUDNN_MAJOR >= 8) && (CUDART_VERSION >= 11000)
+__nv_bfloat16 *cuda_make_bf16_from_f32_array(float *src, size_t n);
+void cuda_convert_f32_to_bf16(float* input_f32, size_t size, float *output_bf16);
+void cuda_convert_bf16_to_f32(float* input_bf16, size_t size, float *output_f32);
+void cuda_round_f32_to_bf16_inplace(float * data, size_t n);
+void cuda_bf16_kahan_sgd(int n, float lr, float decay_factor, float momentum_factor, float * weight_updates, float * weights_bf16, float * compensation_bf16, float * weights_f32_mirror);
+void cuda_bf16_kahan_commit(int n, const float * weights_f32, float * weights_bf16, float * compensation_bf16);
+#endif
+void* cuda_make_lowp_from_f32_array(float* src, size_t n, bool is_bf16);
+void cuda_convert_f32_to_lowp(float* src, size_t n, void* dst, bool is_bf16);
+void cuda_convert_lowp_to_f32(void* src, size_t n, float* dst, bool is_bf16);
+#if defined(DARKNET_GPU_CUDA) && (CUDNN_MAJOR >= 9) && (CUDART_VERSION >= 12000)
+void cuda_convert_f32_to_fp8(float* input_f32, size_t size, float *output_fp8);
+void cuda_convert_fp8_to_f32(float* input_fp8, size_t size, float *output_f32);
+void cuda_convert_f32_to_bf16_via_fp8(float* input_f32, size_t size, float *output_bf16);
+void cuda_quantize_f32_to_fp8_and_dequantize_bf16(float *input_f32, size_t size, uint8_t *output_fp8, float *scale_gpu, float *amax_ema_gpu, int fp8_format, int update_scale, float *output_bf16);
+void cuda_quantize_bf16_to_fp8_and_dequantize_bf16(float *input_bf16, size_t size, uint8_t *output_fp8, float *scale_gpu, float *amax_ema_gpu, int fp8_format, int update_scale, float *output_bf16);
+void cuda_fp8_current_scale_quantize_bf16(float *input_f32, size_t size, uint8_t *output_fp8, float *amax_gpu, float *amax_ema_gpu, int fp8_format, float *output_bf16);
+void cuda_quantize_f32_to_fp8_bf16_by_policy(float *input_f32, size_t size, uint8_t *output_fp8, float *scale_gpu, float *amax_ema_gpu, int fp8_format, int use_current_scaling, int update_scale, float *output_bf16);
+void cuda_quantize_bf16_to_fp8_bf16_by_policy(float *input_bf16, size_t size, uint8_t *output_fp8, float *scale_gpu, float *amax_ema_gpu, int fp8_format, int use_current_scaling, int update_scale, float *output_bf16);
+#endif
 #endif
 #endif
 void free_convolutional_batchnorm(Darknet::Layer *l);

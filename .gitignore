@@ -12,7 +12,19 @@ __pycache__/
 .vscode
 *.kdev4
 
+.DS_Store
+
 *.weights
 
 # Visual Studio C++ generated binary of .rc file
 *.aps
+DSCN1582A_output.m4v
+chart.png
+chart_center.png
+chart_medium_gear.png
+chart_pin.png
+chart_red_light.png
+chart_small_gear.png
+dump.txt
+build_cpp23_gcc15
+build_cpu_cpp23

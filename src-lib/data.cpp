@@ -76,7 +76,7 @@ list *get_paths(const char *filename)
 	}
 
 	list *lines = make_list();
-	while((path=fgetl(file)))
+	while((path=fgetl_cstr(file)))
 	{
 		list_insert(lines, path);
 	}
@@ -89,6 +89,37 @@ list *get_paths(const char *filename)
 
 	return lines;
 }
+
+
+Darknet::VStr get_paths_vstr(const std::string & filename)
+{
+	TAT(TATPARMS);
+
+	Darknet::VStr lines;
+	FILE *file = fopen(filename.c_str(), "r");
+	if (!file)
+	{
+		file_error(filename.c_str(), DARKNET_LOC);
+	}
+
+	std::string line;
+	while (!(line = fgetl(file)).empty() || !feof(file))
+	{
+		if (!line.empty())
+		{
+			lines.push_back(line);
+		}
+	}
+	fclose(file);
+
+	if (lines.empty())
+	{
+		darknet_fatal_error(DARKNET_LOC, "failed to read any lines from %s", filename.c_str());
+	}
+
+	return lines;
+}
+
 
 char **get_sequential_paths(char **paths, int n, int m, int mini_batch, int augment_speed, int contrastive)
 {
@@ -161,6 +192,73 @@ char **get_random_paths(char **paths, int n, int m)
 	TAT(TATPARMS);
 
 	return get_random_paths_custom(paths, n, m, 0);
+}
+
+
+Darknet::VStr get_random_paths_vstr(const Darknet::VStr & paths, int count, int contrastive)
+{
+	TAT(TATPARMS);
+
+	Darknet::VStr result;
+	result.reserve(count);
+
+	const int m = static_cast<int>(paths.size());
+	int old_index = 0;
+
+	for (int i = 0; i < count; ++i)
+	{
+		int index = rand_uint(0, m - 1);
+		if (contrastive && (i % 2 == 1))
+		{
+			index = old_index;
+		}
+		else
+		{
+			old_index = index;
+		}
+		result.push_back(paths[index]);
+	}
+
+	return result;
+}
+
+
+Darknet::VStr get_sequential_paths_vstr(const Darknet::VStr & paths, int count, int mini_batch, int augment_speed, int contrastive)
+{
+	TAT(TATPARMS);
+
+	int speed = rand_int(1, augment_speed);
+	if (speed < 1)
+	{
+		speed = 1;
+	}
+
+	const int m = static_cast<int>(paths.size());
+	Darknet::VStr result;
+	result.reserve(count);
+
+	std::vector<unsigned int> start_time_indexes(mini_batch);
+	for (int i = 0; i < mini_batch; ++i)
+	{
+		if (contrastive && (i % 2) == 1)
+		{
+			start_time_indexes[i] = start_time_indexes[i - 1];
+		}
+		else
+		{
+			start_time_indexes[i] = rand_uint(0, m - 1);
+		}
+	}
+
+	for (int i = 0; i < count; ++i)
+	{
+		int time_line_index = i % mini_batch;
+		unsigned int index = start_time_indexes[time_line_index] % m;
+		start_time_indexes[time_line_index] += speed;
+		result.push_back(paths[index]);
+	}
+
+	return result;
 }
 
 
@@ -247,6 +345,13 @@ box_label *read_boxes(const char *filename, int *n)
 }
 
 
+box_label *read_boxes(const std::string & filename, int *n)
+{
+	TAT(TATPARMS);
+	return read_boxes(filename.c_str(), n);
+}
+
+
 void correct_boxes(box_label *boxes, int n, float dx, float dy, float sx, float sy, int flip)
 {
 	TAT(TATPARMS);
@@ -305,8 +410,7 @@ int fill_truth_detection(const char *path, int num_boxes, int truth_size, float 
 
 	// This method is used during the training process to load the boxes for the given image.
 
-	char labelpath[4096];
-	replace_image_to_label(path, labelpath);
+	const std::string labelpath = replace_image_to_label(path ? path : "");
 
 	int count = 0;
 	int i;
@@ -615,7 +719,7 @@ void blend_truth_mosaic(float *new_truth, int boxes, int truth_size, float *old_
 }
 
 
-data load_data_detection(int n, char **paths, int m, int w, int h, int c, int boxes, int truth_size, int classes, int use_flip, int use_gaussian_noise, int use_blur, int use_mixup,
+data load_data_detection(int n, char **paths, int m, int w, int h, int c, int boxes, int truth_size, int classes, int use_flip, int use_gaussian_noise, int use_blur, int use_fog, int use_mixup,
 	float jitter, float resize, float hue, float saturation, float exposure, int mini_batch, int track, int augment_speed, int letter_box, int mosaic_bound, int contrastive, int contrastive_jit_flip, int contrastive_color, int show_imgs)
 {
 	TAT(TATPARMS);
@@ -675,6 +779,7 @@ data load_data_detection(int n, char **paths, int m, int w, int h, int c, int bo
 	float blur = 0.0f;
 	int augmentation_calculated = 0;
 	int gaussian_noise = 0;
+	int fog = 0;
 
 	d.y = make_matrix(n, truth_size * boxes);
 
@@ -770,9 +875,17 @@ data load_data_detection(int n, char **paths, int m, int w, int h, int c, int bo
 				{
 					gaussian_noise = use_gaussian_noise;
 				}
+				else {
+					gaussian_noise = 0;
+				}
+
+				if (use_fog && rand_bool())
+				{
+					fog = use_fog;
+				}
 				else
 				{
-					gaussian_noise = 0;
+					fog = 0;
 				}
 			}
 
@@ -854,7 +967,7 @@ data load_data_detection(int n, char **paths, int m, int w, int h, int c, int bo
 				blur = min_w_h / 8;   // disable blur if one of the objects is too small
 			}
 
-			Darknet::Image ai = image_data_augmentation(src, w, h, pleft, ptop, swidth, sheight, flip, dhue, dsat, dexp, gaussian_noise, blur, boxes, truth_size, truth);
+			Darknet::Image ai = image_data_augmentation(src, w, h, pleft, ptop, swidth, sheight, flip, dhue, dsat, dexp, gaussian_noise, blur, fog, boxes, truth_size, truth);
 
 			if (use_mixup == 0)
 			{
@@ -938,8 +1051,7 @@ data load_data_detection(int n, char **paths, int m, int w, int h, int c, int bo
 				const int random_index = rand_uint();
 
 				Darknet::Image tmp_ai = Darknet::copy_image(ai);
-				char buff[1000];
-				sprintf(buff, "aug_%d_%d_%d", random_index, i, rand_uint());
+				const std::string aug_name = "aug_" + std::to_string(random_index) + "_" + std::to_string(i) + "_" + std::to_string(rand_uint());
 				int t;
 				for (t = 0; t < boxes; ++t)
 				{
@@ -952,10 +1064,10 @@ data load_data_detection(int n, char **paths, int m, int w, int h, int c, int bo
 					Darknet::draw_box_width(tmp_ai, left, top, right, bot, 1, 150, 100, 50); // 3 channels RGB
 				}
 
-				Darknet::save_image(tmp_ai, buff);
-				if (show_imgs == 1)
+				Darknet::save_image(tmp_ai, aug_name.c_str());
+					if (show_imgs == 1)
 				{
-					Darknet::show_image(tmp_ai, buff);
+					Darknet::show_image(tmp_ai, aug_name.c_str());
 					cv::waitKey(0);
 				}
 				Darknet::free_image(tmp_ai);
@@ -1005,7 +1117,7 @@ void Darknet::load_single_image_data(load_args args)
 		case DETECTION_DATA:
 		{
 			// 2024:  used in detector.cpp (when training a neural network)
-			*args.d = load_data_detection(args.n, args.paths, args.m, args.w, args.h, args.c, args.num_boxes, args.truth_size, args.classes, args.flip, args.gaussian_noise, args.blur, args.mixup, args.jitter, args.resize,
+			*args.d = load_data_detection(args.n, args.paths, args.m, args.w, args.h, args.c, args.num_boxes, args.truth_size, args.classes, args.flip, args.gaussian_noise, args.blur, args.fog, args.mixup, args.jitter, args.resize,
 					args.hue, args.saturation, args.exposure, args.mini_batch, args.track, args.augment_speed, args.letter_box, args.mosaic_bound, args.contrastive, args.contrastive_jit_flip, args.contrastive_color, args.show_imgs);
 			break;
 		}

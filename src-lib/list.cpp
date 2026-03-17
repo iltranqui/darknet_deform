@@ -85,8 +85,7 @@ void free_list_contents_kvp(list *l)
 	while (n)
 	{
 		kvp* p = (kvp*)n->val;
-		free((void*)p->key);
-		free((void*)n->val);
+		delete p;  // kvp now uses std::string members and is allocated with new
 		n = n->next;
 	}
 }

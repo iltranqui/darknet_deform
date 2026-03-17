@@ -1,5 +1,4 @@
 #include "darknet_internal.hpp"
-#include <locale>
 
 #ifdef WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -97,14 +96,6 @@ Darknet::CfgAndState & Darknet::CfgAndState::reset()
 	std::srand(std::time(nullptr));
 	// ... also see the seeding that happens in get_rnd_engine()
 
-	/* Some European locales use comma instead of period in the formatting of floats:
-	 *
-	 *		0,123 vs 0.123
-	 *
-	 * so force the locale to use the standard "C" locale and (hopefully!) avoid any parsing issues.
-	 */
-	std::setlocale(LC_ALL, "C");
-
 	/* Default is to use std::cout for console output.  Do *NOT* call set_output_stream() from here,
 	 * since it will cause infinite recursion when it attempts to call CfgAndState::get().
 	 */
@@ -114,8 +105,12 @@ Darknet::CfgAndState & Darknet::CfgAndState::reset()
 	must_immediately_exit	= false;
 	is_shown				= true;
 	colour_is_enabled		= true;
-	is_verbose				= false;
-	is_trace				= false;
+		is_verbose				= false;
+		is_trace				= false;
+		use_cudnn_bf16			= false;
+		use_cudnn_fp8			= false;
+		use_bf16_master_weights	= false;
+		precision_mode			= Darknet::PrecisionMode::FP32;
 
 #ifdef DARKNET_GPU
 	gpu_index				= 0;
@@ -368,9 +363,10 @@ Darknet::CfgAndState & Darknet::CfgAndState::process_arguments(const VStr & v, D
 
 	if (args.count("fp32") +
 		args.count("fp16") +
-		args.count("int8") > 1)
+		args.count("int8") +
+		args.count("fp8") > 1)
 	{
-		darknet_fatal_error(DARKNET_LOC, "conflicting parameters \"int8\", \"fp16\", and \"fp32\" are mutually exclusive and cannot be combined");
+		darknet_fatal_error(DARKNET_LOC, "conflicting parameters \"int8\", \"fp16\", \"fp8\", and \"fp32\" are mutually exclusive and cannot be combined");
 	}
 
 	if (args.count("fuse") +

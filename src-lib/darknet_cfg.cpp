@@ -38,6 +38,152 @@ namespace
 	}
 
 
+	static const char * precision_mode_to_string(const Darknet::PrecisionMode mode)
+	{
+		switch (mode)
+		{
+			case Darknet::PrecisionMode::FP32:		return "FP32";
+			case Darknet::PrecisionMode::FP16:		return "FP16";
+			case Darknet::PrecisionMode::BF16:		return "BF16";
+			case Darknet::PrecisionMode::BF16_MASTER_KAHAN: return "BF16_MASTER_KAHAN";
+			case Darknet::PrecisionMode::FP8_BF16:	return "FP8_BF16";
+		}
+
+		return "UNKNOWN";
+	}
+
+
+	static void apply_fp8_layer_policy(Darknet::Network & net)
+	{
+		TAT(TATPARMS);
+
+		int first_head_layer = net.n;
+		for (int idx = 0; idx < net.n; idx ++)
+		{
+			const auto lt = net.layers[idx].type;
+			if (lt == Darknet::ELayerType::YOLO ||
+				lt == Darknet::ELayerType::REGION ||
+				lt == Darknet::ELayerType::GAUSSIAN_YOLO)
+			{
+				first_head_layer = idx;
+				break;
+			}
+		}
+
+		const bool aggressive = (net.fp8_aggressive != 0);
+		int enabled_count = 0;
+		for (int idx = 0; idx < net.n; idx ++)
+		{
+			Darknet::Layer & l = net.layers[idx];
+			if (!net.cudnn_fp8)
+			{
+				l.fp8_enabled = 0;
+				continue;
+			}
+
+			const int cfg_override = l.fp8_enabled; // -1=auto, 0=off, 1=on
+
+			int auto_enable = 0;
+			const bool tc_aligned = ((l.c / std::max(1, l.groups)) % 8 == 0 && l.n % 8 == 0 && l.groups <= 1);
+			const bool feeds_loss_directly =
+				(idx + 1 < net.n &&
+				(net.layers[idx + 1].type == Darknet::ELayerType::YOLO ||
+				 net.layers[idx + 1].type == Darknet::ELayerType::REGION ||
+				 net.layers[idx + 1].type == Darknet::ELayerType::GAUSSIAN_YOLO));
+			if (l.type == Darknet::ELayerType::CONVOLUTIONAL &&
+				l.groups == 1 &&
+				l.size >= 1 &&
+				l.size <= 3 &&
+				tc_aligned)
+			{
+				if (aggressive)
+				{
+					auto_enable = (feeds_loss_directly ? 0 : 1);
+				}
+				else
+				{
+					auto_enable = (idx < first_head_layer ? 1 : 0);
+				}
+			}
+
+			int enable = auto_enable;
+			if (cfg_override == 0) enable = 0;
+			if (cfg_override == 1) enable = 1;
+			l.fp8_enabled = enable;
+			l.fp8_format = (l.fp8_format == 1 ? 1 : 0);
+			enabled_count += l.fp8_enabled;
+		}
+
+		if (cfg_and_state.is_verbose)
+		{
+			*cfg_and_state.output
+				<< "FP8 policy: enabled " << enabled_count
+				<< " convolutional layer(s)"
+				<< (aggressive ? " in aggressive mode (excluding direct loss feeders)" : " before first detection head")
+				<< " (first head layer index=" << first_head_layer
+				<< ")."
+				<< std::endl;
+		}
+	}
+
+
+	static void report_tensor_core_alignment(const Darknet::Network & net)
+	{
+		TAT(TATPARMS);
+
+		const bool bf16_compute_mode =
+			(net.precision_mode == Darknet::PrecisionMode::BF16 ||
+			 net.precision_mode == Darknet::PrecisionMode::BF16_MASTER_KAHAN ||
+			 net.precision_mode == Darknet::PrecisionMode::FP8_BF16);
+		if (!cfg_and_state.is_verbose || !bf16_compute_mode)
+		{
+			return;
+		}
+
+		int tc_eligible = 0;
+		int tc_ineligible = 0;
+		int detailed_reports = 0;
+		for (int idx = 0; idx < net.n; idx++)
+		{
+			const Darknet::Layer & l = net.layers[idx];
+			if (l.type != Darknet::ELayerType::CONVOLUTIONAL || l.xnor)
+			{
+				continue;
+			}
+
+			const bool channel_aligned = ((l.c / std::max(1, l.groups)) % 8 == 0);
+			const bool filter_aligned = (l.n % 8 == 0);
+			const bool groups_supported = (l.groups <= 1);
+			const bool eligible = (channel_aligned && filter_aligned && groups_supported);
+			if (eligible)
+			{
+				tc_eligible++;
+			}
+			else
+			{
+				tc_ineligible++;
+				if (detailed_reports < 10)
+				{
+					detailed_reports++;
+					*cfg_and_state.output
+						<< "TensorCore note: layer #" << idx
+						<< " (conv " << l.size << "x" << l.size
+						<< ", c=" << l.c << ", n=" << l.n << ", groups=" << l.groups
+						<< ") is not TC-friendly (" << (channel_aligned ? "" : "channels ")
+						<< (filter_aligned ? "" : "filters ")
+						<< (groups_supported ? "" : "groups ")
+						<< "alignment)." << std::endl;
+				}
+			}
+		}
+
+		*cfg_and_state.output
+			<< "TensorCore alignment summary: eligible conv layers="
+			<< tc_eligible << ", non-eligible conv layers=" << tc_ineligible
+			<< "." << std::endl;
+	}
+
+
 	static float * get_classes_multipliers(Darknet::VInt & vi, const int classes, const float max_delta)
 	{
 		TAT(TATPARMS);
@@ -996,14 +1142,16 @@ Darknet::Network & Darknet::CfgFile::create_network(int batch, int time_steps)
 		l.dynamic_minibatch		= net.dynamic_minibatch;
 		l.onlyforward			= section.find_int("onlyforward", 0);
 		l.dont_update			= section.find_int("dont_update", 0);
-		l.burnin_update			= section.find_int("burnin_update", 0);
-		l.stopbackward			= section.find_int("stopbackward", 0);
-		l.train_only_bn			= section.find_int("train_only_bn", 0);
-		l.dontload				= section.find_int("dontload", 0);
-		l.dontloadscales		= section.find_int("dontloadscales", 0);
-		l.learning_rate_scale	= section.find_float("learning_rate", 1);
+			l.burnin_update			= section.find_int("burnin_update", 0);
+			l.stopbackward			= section.find_int("stopbackward", 0);
+			l.train_only_bn			= section.find_int("train_only_bn", 0);
+			l.dontload				= section.find_int("dontload", 0);
+			l.dontloadscales		= section.find_int("dontloadscales", 0);
+			l.learning_rate_scale	= section.find_float("learning_rate", 1);
+			l.fp8_enabled			= section.find_int("fp8", l.fp8_enabled);
+			l.fp8_format			= section.find_int("fp8_format", l.fp8_format);
 
-		section.find_unused_lines();
+			section.find_unused_lines();
 
 		if (l.stopbackward == 1)
 		{
@@ -1171,15 +1319,17 @@ Darknet::Network & Darknet::CfgFile::create_network(int batch, int time_steps)
 			net.input_pinned_cpu = (float*)xcalloc(size, sizeof(float));
 		}
 
-		// pre-allocate memory for inference on Tensor Cores (fp16)
+		// pre-allocate memory for low-precision Tensor Core paths (FP16/BF16/FP8)
 		*net.max_input16_size = 0;
 		*net.max_output16_size = 0;
-		if (net.cudnn_half)
+		if (net.cudnn_half || net.cudnn_bfloat16 || net.cudnn_fp8)
 		{
+			// FP8 mode uses BF16 buffers for cuDNN convolution descriptors in the legacy API path.
+			const size_t lp_element_size = sizeof(short);
 			*net.max_input16_size = parms.max_inputs;
-			CHECK_CUDA(cudaMalloc((void **)net.input16_gpu, *net.max_input16_size * sizeof(short))); //sizeof(half)
+			CHECK_CUDA(cudaMalloc((void **)net.input16_gpu, *net.max_input16_size * lp_element_size));
 			*net.max_output16_size = parms.max_outputs;
-			CHECK_CUDA(cudaMalloc((void **)net.output16_gpu, *net.max_output16_size * sizeof(short))); //sizeof(half)
+			CHECK_CUDA(cudaMalloc((void **)net.output16_gpu, *net.max_output16_size * lp_element_size));
 		}
 
 		if (parms.workspace_size)
@@ -1263,9 +1413,35 @@ Darknet::CfgFile & Darknet::CfgFile::parse_net_section()
 	*net.cuda_graph_ready = 0;
 	net.use_cuda_graph = s.find_int("use_cuda_graph", 0);
 	net.loss_scale = s.find_float("loss_scale", 1);
+	net.fp8_aggressive = s.find_int("fp8_aggressive", 0);
+	net.fp8_requant_interval = std::max(1, s.find_int("fp8_requant_interval", 1));
+	net.fp8_scale_update_interval = std::max(1, s.find_int("fp8_scale_update_interval", 1));
+	net.fp8_debug = s.find_int("fp8_debug", 0);
+	net.fp8_current_scaling = s.find_int("fp8_current_scaling", 1);  // default ON: use current scaling instead of delayed EMA
 	net.dynamic_minibatch = s.find_int("dynamic_minibatch", 0);
 	net.optimized_memory = s.find_int("optimized_memory", 0);
 	net.workspace_size_limit = (size_t)1024*1024 * s.find_float("workspace_size_limit_MB", 1024);  // 1024 MB by default
+
+	if (cfg_and_state.is_set("fp8aggressive"))
+	{
+		net.fp8_aggressive = 1;
+	}
+	if (cfg_and_state.is_set("fp8requantinterval"))
+	{
+		net.fp8_requant_interval = std::max(1, cfg_and_state.get_int("fp8requantinterval"));
+	}
+	if (cfg_and_state.is_set("fp8scaleinterval"))
+	{
+		net.fp8_scale_update_interval = std::max(1, cfg_and_state.get_int("fp8scaleinterval"));
+	}
+	if (cfg_and_state.is_set("fp8debug"))
+	{
+		net.fp8_debug = 1;
+	}
+	if (cfg_and_state.is_set("fp8delayedscaling"))
+	{
+		net.fp8_current_scaling = 0;  // revert to legacy delayed EMA scaling
+	}
 
 	net.adam = s.find_int("adam", 0);
 	if (net.adam)
@@ -1284,6 +1460,7 @@ Darknet::CfgFile & Darknet::CfgFile::parse_net_section()
 	net.flip = s.find_int("flip", 1);
 	net.blur = s.find_int("blur", 0);
 	net.gaussian_noise = s.find_int("gaussian_noise", 0);
+	net.fog = s.find_int("fog", 0);
 	net.mixup = s.find_int("mixup", 0);
 	int cutmix = s.find_int("cutmix", 0);
 	int mosaic = s.find_int("mosaic", 0);
@@ -1331,28 +1508,178 @@ Darknet::CfgFile & Darknet::CfgFile::parse_net_section()
 	net.policy = static_cast<learning_rate_policy>(Darknet::get_learning_rate_policy_from_name(s.find_str("policy", "constant")));
 
 	net.burn_in = s.find_int("burn_in", 0);
+	net.tensor_cores_min_iteration = 3 * net.burn_in;
 
 #ifdef DARKNET_GPU
+	const bool cfg_wants_bf16 = (s.find_int("cudnn_bf16", 0) != 0);
+	const bool cfg_wants_fp8 = (s.find_int("cudnn_fp8", 0) != 0);
+	const bool cfg_wants_bf16_master_kahan = (s.find_int("bf16_master_kahan", s.find_int("bf16_master_weights", 0)) != 0);
 	if (net.gpu_index >= 0)
 	{
 		char device_name[1024];
 		int compute_capability = get_gpu_compute_capability(net.gpu_index, device_name);
-#ifdef CUDNN_HALF
-		if (compute_capability >= 700)
+		const bool cli_wants_bf16 = cfg_and_state.is_set("bf16");
+		const bool cli_wants_fp8 = cfg_and_state.is_set("fp8");
+		const bool cli_wants_bf16_master_kahan = (cfg_and_state.is_set("bf16masterkahan") || cfg_and_state.is_set("bf16master"));
+		const bool cli_wants_fp16 = cfg_and_state.is_set("fp16");
+		const bool cli_wants_fp32 = cfg_and_state.is_set("fp32");
+		const bool cli_wants_int8 = cfg_and_state.is_set("int8");
+		const bool wants_bf16_master_kahan = (cfg_wants_bf16_master_kahan || cli_wants_bf16_master_kahan);
+		const bool wants_bf16_explicit = (cfg_wants_bf16 || cli_wants_bf16 || wants_bf16_master_kahan);
+		const bool wants_fp8_explicit = (cfg_wants_fp8 || cli_wants_fp8);
+		const bool wants_fp16_explicit = cli_wants_fp16;
+		const bool wants_fp32_explicit = cli_wants_fp32;
+		const bool any_explicit_precision = (wants_bf16_explicit || wants_fp8_explicit || wants_fp16_explicit || wants_fp32_explicit || cli_wants_int8);
+		const bool use_auto_precision_chain = !any_explicit_precision;
+		const bool try_fp8 = (wants_fp8_explicit || use_auto_precision_chain);
+		const bool try_bf16 = (wants_bf16_explicit || use_auto_precision_chain);
+		const bool try_fp16 = (wants_fp16_explicit || use_auto_precision_chain);
+
+		// Default policy (no explicit precision flags): FP8 -> BF16 -> FP16 -> FP32 fallback.
+		// FP16/FP32/FP8/BF16 can still be explicitly requested via CLI/cfg.
+		net.cudnn_half = 0;
+		net.cudnn_bfloat16 = 0;
+		net.cudnn_fp8 = 0;
+		net.bf16_master_weights = 0;
+		net.precision_mode = Darknet::PrecisionMode::FP32;
+		cfg_and_state.use_cudnn_bf16 = false;
+		cfg_and_state.use_cudnn_fp8 = false;
+		cfg_and_state.use_bf16_master_weights = false;
+		cfg_and_state.precision_mode = Darknet::PrecisionMode::FP32;
+
+		if (wants_bf16_explicit && wants_fp8_explicit && !wants_bf16_master_kahan)
 		{
-			net.cudnn_half = 1;
+			Darknet::display_warning_msg("Both BF16 and FP8 were requested. FP8 will use the legacy BF16 Tensor Core path when supported.\n");
+		}
+		if (wants_bf16_master_kahan && wants_fp8_explicit)
+		{
+			Darknet::display_warning_msg("BF16_MASTER_KAHAN + FP8 requested: BF16 master weights remain authoritative and FP8 is used for Tensor Core-safe staging.\n");
+		}
+		if (wants_fp32_explicit && (wants_bf16_explicit || wants_fp8_explicit || wants_fp16_explicit))
+		{
+			Darknet::display_warning_msg("FP32 was requested explicitly and takes precedence over BF16/FP8/FP16.\n");
+		}
+
+#if defined(DARKNET_GPU_CUDA) && defined(CUDNN) && defined(CUDNN_HALF) && (CUDNN_MAJOR >= 8) && (CUDART_VERSION >= 11000)
+		if (!wants_fp32_explicit && wants_bf16_master_kahan && try_bf16)
+		{
+			if (compute_capability >= 800)
+			{
+				net.cudnn_bfloat16 = 1;
+				net.cudnn_half = 0;
+				net.precision_mode = (wants_bf16_master_kahan ? Darknet::PrecisionMode::BF16_MASTER_KAHAN : Darknet::PrecisionMode::BF16);
+				cfg_and_state.use_cudnn_bf16 = true;
+				cfg_and_state.precision_mode = net.precision_mode;
+				net.bf16_master_weights = (wants_bf16_master_kahan ? 1 : 0);
+				cfg_and_state.use_bf16_master_weights = (net.bf16_master_weights != 0);
+			}
+			else if (wants_bf16_explicit)
+			{
+				Darknet::display_warning_msg("BF16 requested but GPU compute capability is below 8.0. Falling back to FP16/FP32.\n");
+			}
+		}
+
+		if (!wants_fp32_explicit && try_fp8)
+		{
+#if (CUDNN_MAJOR >= 9) && (CUDART_VERSION >= 12000)
+			if (compute_capability >= 890)
+			{
+				net.cudnn_fp8 = 1;
+				net.cudnn_half = 0;
+				if (net.precision_mode == Darknet::PrecisionMode::FP32)
+				{
+					net.precision_mode = Darknet::PrecisionMode::FP8_BF16;
+				}
+				cfg_and_state.use_cudnn_fp8 = true;
+				cfg_and_state.precision_mode = net.precision_mode;
+				Darknet::display_warning_msg("FP8 requested: cuDNN convolutions will run with CUDA FP8 downcast/upcast and BF16 Tensor Core compute in the legacy NCHW path.\n");
+			}
+			else
+			{
+				if (wants_fp8_explicit)
+				{
+					Darknet::display_warning_msg("FP8 requested but GPU compute capability is below 8.9. Falling back to BF16/FP16/FP32.\n");
+				}
+			}
+#else
+			if (wants_fp8_explicit)
+			{
+				Darknet::display_warning_msg("FP8 requested but this build does not support CUDA/cuDNN FP8. Falling back to BF16/FP16/FP32.\n");
+			}
+#endif
+		}
+
+		if (!wants_fp32_explicit && !wants_bf16_master_kahan && !net.cudnn_fp8 && try_bf16)
+		{
+			if (compute_capability >= 800)
+			{
+				net.cudnn_bfloat16 = 1;
+				net.cudnn_half = 0;
+				net.precision_mode = Darknet::PrecisionMode::BF16;
+				cfg_and_state.use_cudnn_bf16 = true;
+				cfg_and_state.precision_mode = net.precision_mode;
+			}
+			else if (wants_bf16_explicit)
+			{
+				Darknet::display_warning_msg("BF16 requested but GPU compute capability is below 8.0. Falling back to FP16/FP32.\n");
+			}
+		}
+
+		if (!wants_fp32_explicit && !net.cudnn_fp8 && !net.cudnn_bfloat16 && try_fp16)
+		{
+#ifdef CUDNN_HALF
+			if (compute_capability >= 700)
+			{
+				net.cudnn_half = 1;
+				net.precision_mode = Darknet::PrecisionMode::FP16;
+				cfg_and_state.precision_mode = net.precision_mode;
+			}
+			else if (wants_fp16_explicit)
+			{
+				Darknet::display_warning_msg("FP16 requested but GPU compute capability is below 7.0. Falling back to FP32.\n");
+			}
+#else
+			if (wants_fp16_explicit)
+			{
+				Darknet::display_warning_msg("FP16 requested but this build does not support CUDA/cuDNN FP16. Falling back to FP32.\n");
+			}
+#endif
+		}
+#else
+		if (!wants_fp32_explicit && wants_fp8_explicit)
+		{
+			Darknet::display_warning_msg("FP8 requested but this build does not support CUDA/cuDNN FP8. Falling back to BF16/FP16/FP32.\n");
+		}
+		if (!wants_fp32_explicit && wants_bf16_explicit)
+		{
+			Darknet::display_warning_msg("BF16 requested but this build does not support CUDA/cuDNN BF16. Falling back to FP16/FP32.\n");
+		}
+		if (!wants_fp32_explicit && wants_fp16_explicit)
+		{
+			Darknet::display_warning_msg("FP16 requested but this build does not support CUDA/cuDNN FP16. Falling back to FP32.\n");
+		}
+#endif
+
+		*cfg_and_state.output
+			<< net.gpu_index
+			<< ": compute_capability=" << compute_capability
+			<< ", cudnn_half=" << net.cudnn_half
+			<< ", cudnn_bfloat16=" << net.cudnn_bfloat16
+			<< ", cudnn_fp8=" << net.cudnn_fp8
+			<< ", precision_mode=" << precision_mode_to_string(net.precision_mode)
+			<< ", GPU=" << device_name
+			<< std::endl;
+		apply_fp8_layer_policy(net);
+		report_tensor_core_alignment(net);
 		}
 		else
 		{
-			net.cudnn_half = 0;
-		}
-#endif // CUDNN_HALF
-		*cfg_and_state.output << net.gpu_index << ": compute_capability=" << compute_capability << ", cudnn_half=" << net.cudnn_half << ", GPU=" << device_name << std::endl;
-	}
-	else
-	{
+		cfg_and_state.use_cudnn_bf16 = false;
+		cfg_and_state.use_cudnn_fp8 = false;
+		net.precision_mode = Darknet::PrecisionMode::FP32;
+		cfg_and_state.precision_mode = Darknet::PrecisionMode::FP32;
 		*cfg_and_state.output << "GPU not used" << std::endl;
-	}
+		}
 #endif // DARKNET_GPU
 
 	if (net.policy == STEP)

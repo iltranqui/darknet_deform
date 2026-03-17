@@ -258,8 +258,8 @@ void run_nightmare(int argc, char **argv)
 
 	Darknet::Network net = parse_network_cfg(cfg);
 	load_weights(&net, weights);
-	const char *cfgbase = basecfg(cfg);
-	const char *imbase = basecfg(input);
+	const std::string cfgbase = basecfg(cfg);
+	const std::string imbase = basecfg(input);
 
 	set_batch_network(&net, 1);
 	Darknet::Image im = Darknet::load_image(input, 0, 0, net.c);
@@ -345,17 +345,17 @@ void run_nightmare(int argc, char **argv)
 			im = g;
 		}
 
-		char buff[256];
+		std::string output_name;
 		if (prefix)
 		{
-			sprintf(buff, "%s/%s_%s_%d_%06d", prefix, imbase, cfgbase, max_layer, e);
+			output_name = std::string(prefix) + "/" + imbase + "_" + cfgbase + "_" + std::to_string(max_layer) + "_" + std::to_string(e);
 		}
 		else
 		{
-			sprintf(buff, "%s_%s_%d_%06d", imbase, cfgbase, max_layer, e);
+			output_name = imbase + "_" + cfgbase + "_" + std::to_string(max_layer) + "_" + std::to_string(e);
 		}
-		*cfg_and_state.output << e << " " << buff << std::endl;
-		Darknet::save_image(im, buff);
+		*cfg_and_state.output << e << " " << output_name << std::endl;
+		Darknet::save_image(im, output_name.c_str());
 
 		if (rotate)
 		{

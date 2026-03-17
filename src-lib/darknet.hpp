@@ -1,5 +1,5 @@
 /* Darknet/YOLO:  https://codeberg.org/CCodeRun/darknet
- * Copyright 2024-2025 Stephane Charette
+ * Copyright 2024-2026 Stephane Charette
  */
 
 #pragma once
@@ -51,6 +51,19 @@ namespace Darknet
 	using Detection		= DarknetDetection;
 	using Image			= DarknetImage;
 	/// @}
+
+	/** Runtime precision mode selected for network execution.
+	 *
+	 * `FP8_BF16` means FP8 storage/quantization with BF16 compute buffers for legacy cuDNN convolution descriptors.
+	 */
+	enum class PrecisionMode
+	{
+		FP32,
+		FP16,
+		BF16,
+		BF16_MASTER_KAHAN,
+		FP8_BF16
+	};
 
 	/// The @p layer structure has been renamed and moved to darknet_layer.hpp.
 	struct Layer;

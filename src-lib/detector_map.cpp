@@ -557,10 +557,10 @@ float validate_detector_map(const char * datacfg, const char * cfgfile, const ch
 
 	// load the network, or re-use the network already loaded
 	list * options = read_data_cfg(datacfg);
-	std::string validation_filename = option_find_str(options, "valid", nullptr);
+	std::string validation_filename = option_find_str(options, "valid", "");
 	if (existing_net) // if we're being called in the middle of training a network
 	{
-		const char * train_images = option_find_str(options, "train", nullptr);
+		const std::string train_images = option_find_str(options, "train", "");
 		validation_filename = option_find_str(options, "valid", train_images);
 		shared_info.net = *existing_net;
 		free_network_recurrent_state(*existing_net);

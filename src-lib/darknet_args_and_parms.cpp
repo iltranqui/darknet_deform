@@ -156,9 +156,12 @@ const Darknet::SArgsAndParms & Darknet::get_all_possible_arguments()
 		ArgsAndParms("dontfuse"		, "nofuse"							, "Don't fuse batch normlization and weights/biases.  This is the default when training."),
 		ArgsAndParms("boxes"		, ArgsAndParms::EType::kParameter	, "Output the necessary ONNX nodes to handle post-processing and generate \"boxes\".  This is the default."),
 		ArgsAndParms("noboxes"		, ArgsAndParms::EType::kParameter	, "Do not output ONNX nodes for post-processing.  ONNX ends with \"yolo\" nodes."),
-//		ArgsAndParms("int8"			, ArgsAndParms::EType::kParameter	, "Convert to INT8 (8-bit quantization) when saving the ONNX file."),
+		ArgsAndParms("int8"			, ArgsAndParms::EType::kParameter	, "Convert to INT8 (8-bit quantization) when saving the ONNX file."),
 		ArgsAndParms("fp16"			, ArgsAndParms::EType::kParameter	, "Convert to FP16 (16-bit floats) when saving the ONNX file."),
 		ArgsAndParms("fp32"			, ArgsAndParms::EType::kParameter	, "Use FP32 (32-bit floats) when saving the ONNX file.  This is the default."),
+		ArgsAndParms("bf16"			, ArgsAndParms::EType::kParameter	, "Use BF16 mixed precision for CUDA/cuDNN training when supported (SM80+ and cuDNN v8+)."),
+		ArgsAndParms("bf16masterkahan", "bf16master", ArgsAndParms::EType::kParameter, "Use experimental BF16 master weights with Kahan-compensated updates. This is separate from plain BF16."),
+		ArgsAndParms("fp8"			, ArgsAndParms::EType::kParameter	, "Use experimental FP8 (E4M3) mixed precision for CUDA/cuDNN training when supported (SM89+ and cuDNN v9+)."),
 
 		// I originally didn't know about "show_details" when I implemented "verbose".
 		ArgsAndParms("verbose"		, "show_details"					, "Logs more verbose messages."),
@@ -175,6 +178,11 @@ const Darknet::SArgsAndParms & Darknet::get_all_possible_arguments()
 		ArgsAndParms("nms"		, "nmsthresh"	, 0.45f	, "The NMS (non-maximal suppression) threshold."),
 
 		ArgsAndParms("saveweights", "", 0, "How often the .weights are saved during training.  For example, this could be set to \"500\" to save the weights every 500 iteration."),
+		ArgsAndParms("savebf16", "savebf16weights", ArgsAndParms::EType::kParameter, "Save checkpoints in BF16 weights format instead of legacy FP32."),
+		ArgsAndParms("fp8aggressive", ArgsAndParms::EType::kParameter, "Enable aggressive FP8 layer policy (still excludes layers directly feeding loss heads)."),
+		ArgsAndParms("fp8requantinterval", "", 1, "How many iterations to keep FP8/BF16 staged weights before re-quantizing from FP32 master weights."),
+		ArgsAndParms("fp8scaleinterval", "", 1, "How often FP8 amax/scale are updated (in low-precision steps)."),
+		ArgsAndParms("fp8delayedscaling", ArgsAndParms::EType::kParameter, "Use delayed EMA-based FP8 scaling instead of current scaling to reduce quantization overhead."),
 
 		ArgsAndParms("avgframes"			), //-- takes an int  3
 		ArgsAndParms("benchmark"			),
@@ -386,6 +394,10 @@ void Darknet::display_usage()
 		<< YELLOW("    darknet detector train -map -dont_show cars.data cars.cfg cars_last.weights -gpus 0,1") << std::endl
 		<< "  Train a network but start with the given pre-existing weights, clearing the image count to restart at zero:" << std::endl
 		<< YELLOW("    darknet detector train -map -dont_show cars.data cars.cfg cars_best.weights -clear") << std::endl
+		<< "  Train a network in BF16 mixed precision on supported NVIDIA hardware:"				<< std::endl
+		<< YELLOW("    darknet detector train -bf16 -map -dont_show cars.data cars.cfg")			<< std::endl
+		<< "  Train a network in experimental FP8 mixed precision on supported NVIDIA hardware:"	<< std::endl
+		<< YELLOW("    darknet detector train -fp8 -map -dont_show cars.data cars.cfg")			<< std::endl
 		<< ""																						<< std::endl
 		<< "  Check the mAP% results:"																<< std::endl
 		<< YELLOW("    darknet detector map cars.data cars.cfg cars_best.weights")					<< std::endl
@@ -438,8 +450,8 @@ void Darknet::display_usage()
 		<< YELLOW("    darknet_onnx_export -dontfuse -trace cars.cfg cars.weights cars.names")		<< std::endl
 		<< "  Export Darknet/YOLO configuration and weights, but use 16-bit floats instead:"		<< std::endl
 		<< YELLOW("    darknet_onnx_export cars -fp16")												<< std::endl
-//		<< "  Export Darknet/YOLO configuration and weights, but use 8-bit integer quantization:"	<< std::endl
-//		<< YELLOW("    darknet_onnx_export cars -int8")												<< std::endl
+		<< "  Export Darknet/YOLO configuration and weights, but use 8-bit integer quantization:"	<< std::endl
+		<< YELLOW("    darknet_onnx_export cars -int8")												<< std::endl
 		<< "  ONNX export tool requires Google ProtoBuffer to be installed when building Darknet."	<< std::endl
 		<< ""																						<< std::endl
 		<< "  Redirect console output to a file (this also turns off colour output):"				<< std::endl

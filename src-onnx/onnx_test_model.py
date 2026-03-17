@@ -21,10 +21,18 @@ if len(sys.argv) != 3:
 session = ort.InferenceSession(sys.argv[1], providers=["CPUExecutionProvider"])
 input_name = session.get_inputs()[0].name
 input_shape = session.get_inputs()[0].shape  # e.g. [1, 3, 160, 224]
+input_type = session.get_inputs()[0].type    # e.g. "tensor(float)" or "tensor(float16)"
 output_names = [o.name for o in session.get_outputs()]
+
+# Detect the expected input dtype from the ONNX model
+if "float16" in input_type:
+    np_dtype = "float16"
+else:
+    np_dtype = "float32"
 
 print(f"Input name:   {input_name}")
 print(f"Input shape:  {input_shape}")
+print(f"Input type:   {input_type} -> using {np_dtype}")
 print(f"Output names: {output_names}")
 
 # load the image
@@ -34,11 +42,11 @@ W_img, H_img = img.size
 _, _, H, W = input_shape
 img_resized = img.resize((W, H))
 
-# convert to either "float16" or "float32"; if darknet_onnx_export is called with -fp16, then the input image needs to be "float16"
-img_np = np.array(img_resized).astype("float32") / 255.0
+# convert to the dtype expected by the model (float16 for -fp16, float32 for -fp32 and -int8)
+img_np = np.array(img_resized).astype(np_dtype) / 255.0
 img_np = np.transpose(img_np, (2, 0, 1))  # (3, H, W)
 img_np = np.expand_dims(img_np, axis=0)
-print(f"Tensor shape: {img_np.shape}")
+print(f"Tensor shape: {img_np.shape}, dtype: {img_np.dtype}")
 
 outputs = session.run(output_names, {input_name: img_np})
 

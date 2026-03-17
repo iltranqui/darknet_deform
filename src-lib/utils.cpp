@@ -1,6 +1,8 @@
 #define _CRT_RAND_S
 
 #include <csignal>
+#include <cstdlib>
+#include <filesystem>
 #include <regex>
 #include "darknet_internal.hpp"
 #include "darkunistd.hpp"
@@ -76,20 +78,23 @@ int *read_map(const char *filename)
 
 	int n = 0;
 	int *map = 0;
-	char *str;
 	FILE *file = fopen(filename, "r");
 	if (!file)
 	{
 		file_error(filename, DARKNET_LOC);
 	}
 
-	while((str=fgetl(file)))
+	std::string str;
+	while (!(str = fgetl(file)).empty() || !feof(file))
 	{
+		if (str.empty())
+		{
+			continue;
+		}
 		++n;
 		/// @todo the while loop reallocs the array at every iteration, this needs to be refactored!
 		map = (int*)xrealloc(map, n * sizeof(int));
-		map[n-1] = atoi(str);
-		free(str);
+		map[n-1] = std::stoi(str);
 	}
 	if (file) fclose(file);
 	return map;
@@ -222,7 +227,7 @@ const char * find_char_arg(int argc, char **argv, const char *arg, const char *d
 }
 
 
-const char *basecfg(const char * cfgfile)
+std::string basecfg(const std::string & cfgfile)
 {
 	TAT(TATPARMS);
 
@@ -237,31 +242,20 @@ const char *basecfg(const char * cfgfile)
 	 * Output == 00000260
 	 */
 
-	/// @todo 2025-04-18 replace all of this with @p std::filesystem::path::stem()?
+	return std::filesystem::path(cfgfile).stem().string();
+}
 
-	char * c = const_cast<char*>(cfgfile);
-	char *next;
-	while((next = strchr(c, '/')))
-	{
-		c = next+1;
-	}
 
-	if (!next)
-	{
-		while ((next = strchr(c, '\\')))
-		{
-			c = next + 1;
-		}
-	}
+const char *basecfg_cstr(const char * cfgfile)
+{
+	TAT(TATPARMS);
 
-	c = copy_string(c);
-	next = strchr(c, '.');
+	// Deprecated: use basecfg() returning std::string instead.
+	// This allocates memory that the caller must free.
 
-	if (next)
-	{
-		*next = 0;
-	}
-
+	std::string result = basecfg(cfgfile ? cfgfile : "");
+	char * c = (char*)xmalloc(result.size() + 1);
+	memcpy(c, result.c_str(), result.size() + 1);
 	return c;
 }
 
@@ -280,43 +274,52 @@ char int_to_alphanum(int i)
 	return (i < 10) ? i + 48 : i + 87;
 }
 
+std::string find_replace(const std::string & str, const std::string & orig, const std::string & rep)
+{
+	TAT(TATPARMS);
+
+	std::string result = str;
+	size_t pos = result.find(orig);
+	if (pos != std::string::npos)
+	{
+		result.replace(pos, orig.length(), rep);
+	}
+	return result;
+}
+
+
 void find_replace(const char* str, char* orig, char* rep, char* output)
 {
 	TAT(TATPARMS);
 
-	char* buffer = (char*)calloc(8192, sizeof(char));
-	char *p;
+	// Deprecated: use find_replace() returning std::string instead.
 
-	sprintf(buffer, "%s", str);
-	if (!(p = strstr(buffer, orig)))
-	{
-		// Is 'orig' even in 'str'?
-		sprintf(output, "%s", buffer);
-		free(buffer);
-		return;
-	}
-
-	*p = '\0';
-
-	sprintf(output, "%s%s%s", buffer, rep, p + strlen(orig));
-	free(buffer);
+	std::string result = find_replace(
+		str ? str : "",
+		orig ? orig : "",
+		rep ? rep : "");
+	strcpy(output, result.c_str());
 }
+
+std::string replace_image_to_label(const std::string & input_path)
+{
+	TAT(TATPARMS);
+
+	// Change the extension to ".txt"
+	std::filesystem::path p(input_path);
+	p.replace_extension(".txt");
+	return p.string();
+}
+
 
 void replace_image_to_label(const char* input_path, char* output_path)
 {
 	TAT(TATPARMS);
 
-	// keep it simple -- copy the input path, but change the extension to ".txt"
+	// Deprecated: use replace_image_to_label() returning std::string instead.
 
-	strcpy(output_path, input_path);
-	auto ptr = strrchr(output_path, '.');
-	if (ptr)
-	{
-		ptr[0] = '\0';
-	}
-	strcat(output_path, ".txt");
-
-	return;
+	std::string result = replace_image_to_label(input_path ? input_path : "");
+	strcpy(output_path, result.c_str());
 }
 
 float sec(clock_t clocks)
@@ -496,9 +499,8 @@ namespace
 	}
 
 	// Don't bother trying to exit() cleanly since some threads might be tied up in CUDA calls that
-	// tend to hang when things go wrong.  Reset the signal handler to the default action and abort.
-	std::signal(SIGABRT, SIG_DFL);
-	std::abort();
+	// tend to hang when things go wrong. Exit immediately without forcing SIGABRT/core-dump behavior.
+	std::_Exit(EXIT_FAILURE);
 }
 
 
@@ -694,61 +696,59 @@ void free_ptrs(void **ptrs, int n)
 }
 
 
-char * fgetl(FILE *fp)
+std::string fgetl(FILE *fp)
 {
 	TAT(TATPARMS);
 
 	if (feof(fp))
 	{
-		return nullptr;
+		return {};
 	}
 
-	// get the first part of the line...
-	size_t size = 512;
-	char * line = (char*)xmalloc(size * sizeof(char));
-	if (!fgets(line, size, fp))
-	{
-		free(line);
-		return 0;
-	}
+	std::string line;
+	char buffer[512];
 
-	// ...and if the line does not end with \n we reallocate and keep reading more
-	size_t curr = strlen(line);
-	while ((line[curr - 1] != '\n') && !feof(fp))
+	while (fgets(buffer, sizeof(buffer), fp))
 	{
-		if (curr == size - 1)
+		line += buffer;
+		if (!line.empty() && line.back() == '\n')
 		{
-			size *= 2;
-			line = (char*)xrealloc(line, size * sizeof(char));
-		}
-		size_t readsize = size-curr;
-		if (readsize > INT_MAX)
-		{
-			readsize = INT_MAX-1;
-		}
-
-		auto ptr = fgets(&line[curr], readsize, fp);
-		curr = strlen(ptr);
-	}
-
-	// get rid of CR and LF at the end of the line
-	if (curr >= 2)
-	{
-		if (line[curr-2] == '\r')
-		{
-			line[curr-2] = '\0';
+			break;
 		}
 	}
 
-	if (curr >= 1)
+	// If nothing was read and we hit EOF, return empty
+	if (line.empty())
 	{
-		if (line[curr-1] == '\n')
-		{
-			line[curr-1] = '\0';
-		}
+		return {};
+	}
+
+	// Strip trailing CR and LF
+	while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
+	{
+		line.pop_back();
 	}
 
 	return line;
+}
+
+
+char * fgetl_cstr(FILE *fp)
+{
+	TAT(TATPARMS);
+
+	// Deprecated: use fgetl() returning std::string instead.
+	// This allocates memory that the caller must free.
+
+	std::string line = fgetl(fp);
+	if (line.empty() && feof(fp))
+	{
+		return nullptr;
+	}
+
+	char * result = (char*)xmalloc(line.size() + 1);
+	memcpy(result, line.c_str(), line.size() + 1);
+	return result;
 }
 
 int read_int(int fd)

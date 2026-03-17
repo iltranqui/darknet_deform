@@ -11,7 +11,7 @@ namespace Darknet
 		int *parent;
 		int *child;
 		int *group;
-		char **name;
+		VStr names;  ///< Class names (converted from char** to VStr)
 
 		int groups;
 		int *group_size;
@@ -19,6 +19,7 @@ namespace Darknet
 	};
 
 	Tree *read_tree(const char * filename);
+	Tree *read_tree(const std::string & filename);
 
 	int hierarchy_top_prediction(float *predictions, Tree *hier, float thresh, int stride);
 	void hierarchy_predictions(float *predictions, int n, Tree *hier, int only_leaves);

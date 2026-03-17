@@ -8,7 +8,16 @@
 
 
 box_label *read_boxes(const char *filename, int *n);
+box_label *read_boxes(const std::string & filename, int *n);
+
 list *get_paths(const char *filename);
+Darknet::VStr get_paths_vstr(const std::string & filename);
+
+/// Get random paths from a VStr collection
+Darknet::VStr get_random_paths_vstr(const Darknet::VStr & paths, int count, int contrastive = 0);
+
+/// Get sequential paths from a VStr collection (for video/tracking)
+Darknet::VStr get_sequential_paths_vstr(const Darknet::VStr & paths, int count, int mini_batch, int augment_speed, int contrastive);
 
 data get_data_part(data d, int part, int total);
 void get_next_batch(data d, int n, int offset, float *X, float *y);

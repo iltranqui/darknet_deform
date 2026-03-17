@@ -1,5 +1,5 @@
 /* Darknet/YOLO:  https://codeberg.org/CCodeRun/darknet
- * Copyright 2024-2025 Stephane Charette
+ * Copyright 2024-2026 Stephane Charette
  */
 
 #include "darknet_onnx.hpp"
@@ -90,6 +90,44 @@ namespace
 			case 23:	return "May 2025";
 		}
 		return "unknown";
+	}
+
+
+	/// Compute INT8 symmetric quantization parameters (scale and zero_point).
+	/// Uses the weight min/max to compute per-tensor scale. Zero-point is 0 for symmetric quantization.
+	/// @param data Pointer to float weights
+	/// @param n Number of weights
+	/// @return pair of (scale, zero_point)
+	static std::pair<float, std::int8_t> compute_int8_quantization_params(const float * data, const size_t n)
+	{
+		if (data == nullptr or n == 0)
+		{
+			return {1.0f, 0};
+		}
+
+		// Find the absolute maximum value
+		float abs_max = 0.0f;
+		for (size_t i = 0; i < n; i++)
+		{
+			const float abs_val = std::abs(data[i]);
+			if (abs_val > abs_max)
+			{
+				abs_max = abs_val;
+			}
+		}
+
+		// Avoid division by zero
+		if (abs_max == 0.0f)
+		{
+			return {1.0f, 0};
+		}
+
+		// Symmetric quantization: scale = abs_max / 127
+		// Using 127 instead of 128 to keep symmetric range [-127, 127]
+		const float scale = abs_max / 127.0f;
+		const std::int8_t zero_point = 0; // Always 0 for symmetric quantization
+
+		return {scale, zero_point};
 	}
 }
 
@@ -248,8 +286,7 @@ Darknet::ONNXExport & Darknet::ONNXExport::display_summary()
 	{
 		*cfg_and_state.output << Darknet::in_colour(colour, "32-bit floats");
 	}
-//	*cfg_and_state.output << Darknet::in_colour(Darknet::EColour::kDarkGrey, " [toggle with -int8 or -fp16 or -fp32]") << std::endl;
-	*cfg_and_state.output << Darknet::in_colour(Darknet::EColour::kDarkGrey, " [toggle with -fp16 or -fp32]") << std::endl;
+	*cfg_and_state.output << Darknet::in_colour(Darknet::EColour::kDarkGrey, " [toggle with -int8 or -fp16 or -fp32]") << std::endl;
 
 	const std::set<std::string> exports_that_use_16_bit_floats =
 	{
@@ -273,6 +310,10 @@ Darknet::ONNXExport & Darknet::ONNXExport::display_summary()
 		{
 			float_size /= 2;
 		}
+		else if (bit_size == 8 and exports_that_use_16_bit_floats.count(key))
+		{
+			float_size = 1; // INT8 weights are 1 byte each
+		}
 
 		// add a comma every 3rd digit to make it easier to read
 		std::string str = std::to_string(val);
@@ -295,8 +336,8 @@ Darknet::ONNXExport & Darknet::ONNXExport::initialize_model()
 	TAT(TATPARMS);
 
 	if (bit_size != 32 and
-		bit_size != 16 )//and
-//		bit_size != 8)
+		bit_size != 16 and
+		bit_size != 8)
 	{
 		throw std::runtime_error("INT8, FP16, and FP32 are supported, but bit size is currently set to " + std::to_string(bit_size) + " which is not supported");
 	}
@@ -431,13 +472,16 @@ Darknet::ONNXExport & Darknet::ONNXExport::populate_input_output_dimensions(onnx
 	auto tensor_type = new onnx::TypeProto_Tensor();
 	type->set_allocated_tensor_type(tensor_type);
 
-	if (bit_size == 32)
+	if (bit_size == 16)
 	{
-		tensor_type->set_elem_type(onnx::TensorProto::FLOAT);
+		// FP16 mode: use half-precision floats
+		tensor_type->set_elem_type(onnx::TensorProto::FLOAT16);
 	}
 	else
 	{
-		tensor_type->set_elem_type(onnx::TensorProto::FLOAT16);
+		// FP32 and INT8 modes: use single-precision floats
+		// (INT8 stores weights as int8 but dequantizes to float for computation)
+		tensor_type->set_elem_type(onnx::TensorProto::FLOAT);
 	}
 
 	auto shape = new onnx::TensorShapeProto();
@@ -636,20 +680,47 @@ Darknet::ONNXExport & Darknet::ONNXExport::add_node_conv(const size_t index, Dar
 		return i;
 	}();
 
+	const auto & l = cfg.net.layers[index];
+
+	// For INT8, we need to reference the dequantized outputs instead of raw weights.
+	// The DequantizeLinear nodes must be created BEFORE the Conv node that uses them
+	// to maintain proper topological order in the ONNX graph.
+	const std::string weights_suffix = (bit_size == 8) ? "_weights_dequant" : "_weights";
+	const std::string bias_suffix = (bit_size == 8) ? "_bias_dequant" : "_bias";
+
+	// Generate the node name prefix that will be used (matching the Node constructor logic)
+	const std::string node_name_prefix = "N" + std::to_string(Node::node_counter) + "_L" + std::to_string(section.index) + "_" + section.name;
+
+	// For INT8, create the initializers and DequantizeLinear nodes BEFORE creating the Conv node
+	// This ensures proper topological ordering (producers before consumers)
+	if (bit_size == 8)
+	{
+		populate_graph_initializer(l.weights, l.nweights, l, node_name_prefix + "_weights");
+
+		const bool has_batch_normalize = section.find_int("batch_normalize", 0) and not fuse_batchnorm;
+		if (not has_batch_normalize)
+		{
+			populate_graph_initializer(l.biases, l.n, l, node_name_prefix + "_bias");
+		}
+	}
+
 	Node node(section);
+
 	node.type("Conv")
 		.add_input(-1)
-		.add_input("_weights")
+		.add_input(weights_suffix)
 		.add_attribute_INT("group"			, 1							)
 		.add_attribute_INTS("pads"			, {pad, pad, pad, pad}		)
 		.add_attribute_INTS("dilations"		, {dilation, dilation}		)
 		.add_attribute_INTS("kernel_shape"	, {kernel_size, kernel_size})
 		.add_attribute_INTS("strides"		, {stride, stride}			);
 
-	const auto & l = cfg.net.layers[index];
-
-	// loosely based on load_convolutional_weights()
-	populate_graph_initializer(l.weights, l.nweights, l, node.name + "_weights");
+	// For FP16 and FP32, create initializers after the Conv node (original order)
+	if (bit_size != 8)
+	{
+		// loosely based on load_convolutional_weights()
+		populate_graph_initializer(l.weights, l.nweights, l, node.name + "_weights");
+	}
 
 	if (section.find_int("batch_normalize", 0) and not fuse_batchnorm)
 	{
@@ -659,8 +730,13 @@ Darknet::ONNXExport & Darknet::ONNXExport::add_node_conv(const size_t index, Dar
 	else
 	{
 		// bias must be added in only 1 place -- either in BN, or here in the Conv if BN isn't used
-		node.add_input("_bias");
-		populate_graph_initializer(l.biases, l.n, l, node.name + "_bias");
+		node.add_input(bias_suffix);
+
+		// For FP16 and FP32, create bias initializer after (original order)
+		if (bit_size != 8)
+		{
+			populate_graph_initializer(l.biases, l.n, l, node.name + "_bias");
+		}
 	}
 
 	check_activation(index, section);
@@ -1016,23 +1092,42 @@ Darknet::ONNXExport & Darknet::ONNXExport::add_node_bn(const size_t index, Darkn
 	TAT(TATPARMS);
 
 	const std::string previous_output = Node::get_output_for_layer_index(index);
+	const auto & l = cfg.net.layers[index];
+
+	// For INT8, we need to reference the dequantized outputs and create DequantizeLinear nodes
+	// BEFORE the BatchNormalization node to maintain proper topological order.
+	const std::string suffix = (bit_size == 8) ? "_dequant" : "";
+
+	// Generate the node name prefix that will be used (matching the Node constructor logic)
+	const std::string node_name_prefix = "N" + std::to_string(Node::node_counter) + "_L" + std::to_string(section.index) + "_" + section.name + "_bn";
+
+	// For INT8, create initializers and DequantizeLinear nodes BEFORE the BN node
+	if (bit_size == 8)
+	{
+		populate_graph_initializer(l.biases				, l.n, l, node_name_prefix + "_bn_bias"		);
+		populate_graph_initializer(l.scales				, l.n, l, node_name_prefix + "_bn_scale"	);
+		populate_graph_initializer(l.rolling_mean		, l.n, l, node_name_prefix + "_bn_mean"		);
+		populate_graph_initializer(l.rolling_variance	, l.n, l, node_name_prefix + "_bn_variance"	);
+	}
 
 	Node node(section, "_bn");
 	node.type("BatchNormalization")
 		.add_input(previous_output)
-		.add_input("_bn_scale"		)
-		.add_input("_bn_bias"		)
-		.add_input("_bn_mean"		)
-		.add_input("_bn_variance"	)
+		.add_input("_bn_scale"		+ suffix)
+		.add_input("_bn_bias"		+ suffix)
+		.add_input("_bn_mean"		+ suffix)
+		.add_input("_bn_variance"	+ suffix)
 		.add_attribute_FLOAT("epsilon", 0.00001f)
 		.add_attribute_FLOAT("momentum", 0.99f);
 
-	const auto & l = cfg.net.layers[index];
-
-	populate_graph_initializer(l.biases				, l.n, l, node.name + "_bn_bias"		); // note this one also exists in "Conv" when BN is disabled
-	populate_graph_initializer(l.scales				, l.n, l, node.name + "_bn_scale"		);
-	populate_graph_initializer(l.rolling_mean		, l.n, l, node.name + "_bn_mean"		);
-	populate_graph_initializer(l.rolling_variance	, l.n, l, node.name + "_bn_variance"	);
+	// For FP16 and FP32, create initializers after the BN node (original order)
+	if (bit_size != 8)
+	{
+		populate_graph_initializer(l.biases				, l.n, l, node.name + "_bn_bias"		); // note this one also exists in "Conv" when BN is disabled
+		populate_graph_initializer(l.scales				, l.n, l, node.name + "_bn_scale"		);
+		populate_graph_initializer(l.rolling_mean		, l.n, l, node.name + "_bn_mean"		);
+		populate_graph_initializer(l.rolling_variance	, l.n, l, node.name + "_bn_variance"	);
+	}
 
 	return *this;
 }
@@ -1098,15 +1193,69 @@ Darknet::ONNXExport & Darknet::ONNXExport::populate_graph_initializer(const floa
 
 		if (must_convert)
 		{
-			initializer->set_data_type(onnx::TensorProto::FLOAT16);
-
-			std::vector<std::uint16_t> v;
-			v.reserve(n);
-			for (size_t i = 0; i < n; i ++)
+			if (bit_size == 8)
 			{
-				v.push_back(Darknet::convert_to_fp16(f[i]));
+				// INT8 quantization using Q/DQ pattern
+				auto [scale, zero_point] = compute_int8_quantization_params(f, n);
+
+				// Store the weights as INT8
+				initializer->set_data_type(onnx::TensorProto::INT8);
+
+				std::vector<std::int8_t> quantized;
+				quantized.reserve(n);
+				for (size_t i = 0; i < n; i++)
+				{
+					// Quantize: q = saturate(round(x / scale))
+					const float scaled = f[i] / scale;
+					const int rounded = static_cast<int>(std::round(scaled));
+					const std::int8_t clamped = static_cast<std::int8_t>(std::clamp(rounded, -127, 127));
+					quantized.push_back(clamped);
+				}
+				initializer->set_raw_data(quantized.data(), quantized.size() * sizeof(std::int8_t));
+
+				// Add scale initializer (scalar float tensor)
+				const std::string scale_name = name + "_scale";
+				onnx::TensorProto * scale_init = graph->add_initializer();
+				scale_init->set_name(scale_name);
+				scale_init->set_data_type(onnx::TensorProto::FLOAT);
+				scale_init->add_float_data(scale);
+				scale_init->set_doc_string("INT8 quantization scale for " + name);
+
+				// Add zero_point initializer (scalar int8 tensor)
+				const std::string zp_name = name + "_zero_point";
+				onnx::TensorProto * zp_init = graph->add_initializer();
+				zp_init->set_name(zp_name);
+				zp_init->set_data_type(onnx::TensorProto::INT8);
+				zp_init->add_int32_data(zero_point); // INT8 values go in int32_data
+				zp_init->set_doc_string("INT8 quantization zero point for " + name);
+
+				// Add DequantizeLinear node to convert INT8 back to float
+				const std::string dequant_output = name + "_dequant";
+				onnx::NodeProto * dequant_node = graph->add_node();
+				dequant_node->set_op_type("DequantizeLinear");
+				dequant_node->set_name(name + "_DequantizeLinear");
+				dequant_node->add_input(name);       // x: INT8 tensor
+				dequant_node->add_input(scale_name); // x_scale
+				dequant_node->add_input(zp_name);    // x_zero_point
+				dequant_node->add_output(dequant_output);
+				dequant_node->set_doc_string("Dequantize INT8 weights to float for " + name);
+
+				// Track that we need to reference _dequant output instead of the raw initializer
+				// This mapping will be handled by the calling code
 			}
-			initializer->set_raw_data(v.data(), v.size() * sizeof(std::uint16_t));
+			else
+			{
+				// FP16 conversion
+				initializer->set_data_type(onnx::TensorProto::FLOAT16);
+
+				std::vector<std::uint16_t> v;
+				v.reserve(n);
+				for (size_t i = 0; i < n; i ++)
+				{
+					v.push_back(Darknet::convert_to_fp16(f[i]));
+				}
+				initializer->set_raw_data(v.data(), v.size() * sizeof(std::uint16_t));
+			}
 		}
 		else
 		{
@@ -1301,6 +1450,12 @@ Darknet::ONNXExport & Darknet::ONNXExport::postprocess_yolo_tx_ty(Darknet::CfgSe
 
 	// This assumes that postprocess_yolo_slice_and_concat() has already run, and we have the "concat_tx_ty" node ready to use.
 
+	// Check if the layer before YOLO has activation=logistic (sigmoid already applied)
+	// and if new_coords=1 is set (different coordinate formula)
+	const bool new_coords = (section.find_int("new_coords", 0) == 1);
+	const auto & prev_layer = cfg.net.layers[section.index - 1];
+	const bool sigmoid_already_applied = (prev_layer.activation == LOGISTIC);
+
 	for (const auto & name : v)
 	{
 		if (name.find("_concat_tx_ty") == std::string::npos)
@@ -1308,34 +1463,54 @@ Darknet::ONNXExport & Darknet::ONNXExport::postprocess_yolo_tx_ty(Darknet::CfgSe
 			continue;
 		}
 
-		// sigmoid brings the values into a range between zero and one
+		std::string current_output = name;
 
-		Node sigmoid(section, "_sigmoid_tx_ty");
-		sigmoid.type("Sigmoid").add_input(name);
+		// Apply sigmoid only if not already applied by the previous layer
+		if (not sigmoid_already_applied)
+		{
+			Node sigmoid(section, "_sigmoid_tx_ty");
+			sigmoid.type("Sigmoid").add_input(current_output);
+			current_output = sigmoid.output;
+		}
 
-		/* ...but instead of [0, 1], we actually want [-0.025, 1.025].  So we need to scale up by 1.05,
-		* and then subtract half to ensure the center points are still located at the right place.
-		*
-		*			normalized_offset = sigmoid(tx) * 1.05 - 0.025
-		*
-		* ChatGPT says:
-		*
-		*			This is an affine transform that “stretches” and “recenters” the sigmoid output,
-		*			giving a bit of extra range outside the cell.
-		*/
-		const float variance = 0.05f;
-		Node const_1_050(section, 1.0f + variance, bit_size);
-		Node const_0_025(section, variance / 2.0f, bit_size);
+		if (new_coords)
+		{
+			// YOLOv7 style: tx * scale_x_y - (scale_x_y - 1) / 2
+			// With scale_x_y = 2.0 (typical for YOLOv7), this becomes: tx * 2 - 0.5
+			const float scale_x_y = section.find_float("scale_x_y", 2.0f);
+			Node const_scale(section, scale_x_y, bit_size);
+			Node const_offset(section, (scale_x_y - 1.0f) / 2.0f, bit_size);
 
-		// multiply by 1.05
-		Node mul(section, "_mul_tx_ty");
-		mul.type("Mul").add_input(sigmoid.output).add_input(const_1_050.output);
+			Node mul(section, "_mul_tx_ty");
+			mul.type("Mul").add_input(current_output).add_input(const_scale.output);
 
-		// shift by -0.025
-		Node sub(section, "_sub_tx_ty");
-		sub.type("Sub").add_input(mul.output).add_input(const_0_025.output);
+			Node sub(section, "_sub_tx_ty");
+			sub.type("Sub").add_input(mul.output).add_input(const_offset.output);
 
-		output_names.push_back(sub.output);
+			output_names.push_back(sub.output);
+		}
+		else
+		{
+			// YOLOv4 style: sigmoid(tx) * 1.05 - 0.025
+			/* ...but instead of [0, 1], we actually want [-0.025, 1.025].  So we need to scale up by 1.05,
+			* and then subtract half to ensure the center points are still located at the right place.
+			*
+			*			normalized_offset = sigmoid(tx) * 1.05 - 0.025
+			*/
+			const float variance = 0.05f;
+			Node const_1_050(section, 1.0f + variance, bit_size);
+			Node const_0_025(section, variance / 2.0f, bit_size);
+
+			// multiply by 1.05
+			Node mul(section, "_mul_tx_ty");
+			mul.type("Mul").add_input(current_output).add_input(const_1_050.output);
+
+			// shift by -0.025
+			Node sub(section, "_sub_tx_ty");
+			sub.type("Sub").add_input(mul.output).add_input(const_0_025.output);
+
+			output_names.push_back(sub.output);
+		}
 	}
 
 	return *this;
@@ -1348,6 +1523,9 @@ Darknet::ONNXExport & Darknet::ONNXExport::postprocess_yolo_tw_th(Darknet::CfgSe
 
 	// This assumes that postprocess_yolo_slice_and_concat() has already run, and we have the "concat_tw_th" node ready to use.
 
+	// Check if new_coords=1 is set (different width/height formula)
+	const bool new_coords = (section.find_int("new_coords", 0) == 1);
+
 	for (const auto & name : v)
 	{
 		if (name.find("_concat_tw_th") == std::string::npos)
@@ -1355,10 +1533,30 @@ Darknet::ONNXExport & Darknet::ONNXExport::postprocess_yolo_tw_th(Darknet::CfgSe
 			continue;
 		}
 
-		Node node(section, "_exp_tw_th");
-		node.type("Exp").add_input(name);
+		if (new_coords)
+		{
+			// YOLOv7 style: (tw * 2)^2
+			// tw is already sigmoided (in range 0-1), so tw * 2 is in range 0-2
+			// Then squared gives range 0-4
+			Node const_2(section, 2.0f, bit_size);
 
-		output_names.push_back(node.output);
+			Node mul(section, "_mul_tw_th");
+			mul.type("Mul").add_input(name).add_input(const_2.output);
+
+			// Square the result: (tw * 2)^2
+			Node square(section, "_square_tw_th");
+			square.type("Mul").add_input(mul.output).add_input(mul.output);
+
+			output_names.push_back(square.output);
+		}
+		else
+		{
+			// YOLOv4 style: exp(tw)
+			Node node(section, "_exp_tw_th");
+			node.type("Exp").add_input(name);
+
+			output_names.push_back(node.output);
+		}
 	}
 
 	return *this;
@@ -1370,6 +1568,10 @@ Darknet::ONNXExport & Darknet::ONNXExport::postprocess_yolo_to(Darknet::CfgSecti
 	TAT(TATPARMS);
 
 	// This assumes that postprocess_yolo_slice_and_concat() has already run, and we have the "concat_obj" node ready to use.
+
+	// Check if the layer before YOLO has activation=logistic (sigmoid already applied)
+	const auto & prev_layer = cfg.net.layers[section.index - 1];
+	const bool sigmoid_already_applied = (prev_layer.activation == LOGISTIC);
 
 	const auto & l					= cfg.net.layers[section.index];
 	const int number_of_masks		= section.find_int_array("mask").size();
@@ -1387,13 +1589,20 @@ Darknet::ONNXExport & Darknet::ONNXExport::postprocess_yolo_to(Darknet::CfgSecti
 		Node reshape1(section, "_reshape_obj");
 		reshape1.type("Reshape").add_input(name).add_input(reshape_const_1);
 
-		Node sigmoid(section, "_sigmoid_obj");
-		sigmoid.type("Sigmoid").add_input(reshape1.output);
+		std::string current_output = reshape1.output;
+
+		// Apply sigmoid only if not already applied by the previous layer
+		if (not sigmoid_already_applied)
+		{
+			Node sigmoid(section, "_sigmoid_obj");
+			sigmoid.type("Sigmoid").add_input(current_output);
+			current_output = sigmoid.output;
+		}
 
 		reshape_vector.push_back(1);
 		const auto reshape_const_2 = Node(section, reshape_vector).output;
 		Node reshape2(section, "_reshape_obj");
-		reshape2.type("Reshape").add_input(sigmoid.output).add_input(reshape_const_2);
+		reshape2.type("Reshape").add_input(current_output).add_input(reshape_const_2);
 
 		output_names.push_back(reshape2.output);
 	}
@@ -1407,6 +1616,10 @@ Darknet::ONNXExport & Darknet::ONNXExport::postprocess_yolo_class(Darknet::CfgSe
 	TAT(TATPARMS);
 
 	// This assumes that postprocess_yolo_slice_and_concat() has already run, and we have the "concat_class" node ready to use.
+
+	// Check if the layer before YOLO has activation=logistic (sigmoid already applied)
+	const auto & prev_layer = cfg.net.layers[section.index - 1];
+	const bool sigmoid_already_applied = (prev_layer.activation == LOGISTIC);
 
 	const auto & l					= cfg.net.layers[section.index];
 	const int number_of_classes		= section.find_int("classes");
@@ -1432,10 +1645,17 @@ Darknet::ONNXExport & Darknet::ONNXExport::postprocess_yolo_class(Darknet::CfgSe
 		Node reshape2(section, "_reshape_class");
 		reshape2.type("Reshape").add_input(transpose.output).add_input(const_shape_2);
 
-		Node sigmoid(section, "_sigmoid_class");
-		sigmoid.type("Sigmoid").add_input(reshape2.output);
-
-		output_names.push_back(sigmoid.output);
+		// Apply sigmoid only if not already applied by the previous layer
+		if (sigmoid_already_applied)
+		{
+			output_names.push_back(reshape2.output);
+		}
+		else
+		{
+			Node sigmoid(section, "_sigmoid_class");
+			sigmoid.type("Sigmoid").add_input(reshape2.output);
+			output_names.push_back(sigmoid.output);
+		}
 	}
 
 	return *this;
@@ -1585,7 +1805,7 @@ Darknet::VStr Darknet::ONNXExport::postprocess_yolo_boxes(const Darknet::VStr & 
 			}
 
 			onnx::TensorProto tensor;
-			tensor.set_data_type(bit_size == 32 ? onnx::TensorProto_DataType_FLOAT : onnx::TensorProto_DataType_FLOAT16);
+			tensor.set_data_type(bit_size == 16 ? onnx::TensorProto_DataType_FLOAT16 : onnx::TensorProto_DataType_FLOAT);
 			tensor.add_dims(1);
 			tensor.add_dims(1);
 			tensor.add_dims(l.h);
@@ -1601,25 +1821,25 @@ Darknet::VStr Darknet::ONNXExport::postprocess_yolo_boxes(const Darknet::VStr & 
 					if (i % 2 == 0)
 					{
 						// X values
-						if (bit_size == 32)
+						if (bit_size == 16)
 						{
-							tensor.add_float_data(w);
+							v.push_back(Darknet::convert_to_fp16(w));
 						}
 						else
 						{
-							v.push_back(Darknet::convert_to_fp16(w));
+							tensor.add_float_data(w);
 						}
 					}
 					else
 					{
 						// Y values
-						if (bit_size == 32)
+						if (bit_size == 16)
 						{
-							tensor.add_float_data(h);
+							v.push_back(Darknet::convert_to_fp16(h));
 						}
 						else
 						{
-							v.push_back(Darknet::convert_to_fp16(h));
+							tensor.add_float_data(h);
 						}
 					}
 				}
@@ -1686,7 +1906,7 @@ Darknet::VStr Darknet::ONNXExport::postprocess_yolo_boxes(const Darknet::VStr & 
 			}
 
 			onnx::TensorProto tensor;
-			if (bit_size < 32)
+			if (bit_size == 16)
 			{
 				tensor.set_data_type(onnx::TensorProto_DataType_FLOAT16);
 				std::vector<std::uint16_t> v;
@@ -1725,17 +1945,17 @@ Darknet::VStr Darknet::ONNXExport::postprocess_yolo_boxes(const Darknet::VStr & 
 
 			onnx::TensorProto tensor;
 			const float f = (name == "lhs" ? l.w : l.h);
-			if (bit_size == 32)
-			{
-				tensor.set_data_type(onnx::TensorProto_DataType_FLOAT);
-				tensor.add_float_data(f);
-			}
-			else
+			if (bit_size == 16)
 			{
 				std::vector<std::uint16_t> v;
 				v.push_back(Darknet::convert_to_fp16(f));
 				tensor.set_data_type(onnx::TensorProto_DataType_FLOAT16);
 				tensor.set_raw_data(v.data(), v.size() * sizeof(std::uint16_t));
+			}
+			else
+			{
+				tensor.set_data_type(onnx::TensorProto_DataType_FLOAT);
+				tensor.add_float_data(f);
 			}
 			Node constants(section, "_const_" + name);
 			constants.type("Constant");

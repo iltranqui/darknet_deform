@@ -7,7 +7,6 @@ namespace
 {
 	static auto & cfg_and_state = Darknet::CfgAndState::get();
 
-
 	inline void binarize_cpu(float *input, int n, float *binary)
 	{
 		TAT_COMMENT(TATPARMS, "2024-05-14 inlined");
@@ -333,6 +332,28 @@ void cudnn_convolutional_setup(Darknet::Layer *l, int cudnn_preference, size_t w
 	// PSEUDO_HALF_CONFIG is required for Tensor Cores - our case!
 
 	cudnnDataType_t data_type = CUDNN_DATA_FLOAT;
+	cudnnDataType_t data_type_16 = CUDNN_DATA_HALF;
+	static bool fp8_legacy_notice_printed = false;
+
+#if defined(DARKNET_GPU_CUDA) && (CUDNN_MAJOR >= 8) && (CUDART_VERSION >= 11000)
+	if (cfg_and_state.use_cudnn_bf16)
+	{
+		data_type_16 = CUDNN_DATA_BFLOAT16;
+	}
+#endif
+#if defined(DARKNET_GPU_CUDA) && (CUDNN_MAJOR >= 9) && (CUDART_VERSION >= 12000)
+	if (cfg_and_state.use_cudnn_fp8)
+	{
+		// Legacy NCHW cuDNN convolution descriptors reject FP8 tensors on many layer shapes.
+		// In FP8 mode we quantize to FP8 in CUDA kernels and upcast to BF16 for cuDNN compute.
+		data_type_16 = CUDNN_DATA_BFLOAT16;
+		if (!fp8_legacy_notice_printed)
+		{
+			fp8_legacy_notice_printed = true;
+			Darknet::display_warning_msg("FP8 mode: using FP8 quantization with BF16 upcast for cuDNN convolutions (legacy descriptor path).\n");
+		}
+	}
+#endif
 
 #if (CUDNN_MAJOR >= 7)
 	// Tensor Core uses CUDNN_TENSOR_OP_MATH instead of CUDNN_DEFAULT_MATH
@@ -348,9 +369,6 @@ void cudnn_convolutional_setup(Darknet::Layer *l, int cudnn_preference, size_t w
 	if (l->stride_y < 1) l->stride_y = 1;
 	CHECK_CUDNN(cudnnSetConvolutionGroupCount(l->convDesc, l->groups));
 	CHECK_CUDNN(cudnnSetConvolutionMathType(l->convDesc, CUDNN_TENSOR_OP_MATH));
-#if ((CUDNN_MAJOR*10 + CUDNN_MINOR) >= 72)   // cuDNN >= 7.2
-	//CHECK_CUDNN(cudnnSetConvolutionMathType(l->convDesc, CUDNN_TENSOR_OP_MATH_ALLOW_CONVERSION)); // reduces the speed of regular and group convolution
-#endif
 #else   //if (CUDNN_MAJOR >= 7)
 	if (l->groups > 1)
 	{
@@ -362,28 +380,31 @@ void cudnn_convolutional_setup(Darknet::Layer *l, int cudnn_preference, size_t w
 	//   on architectures with DP4A support (compute capability 6.1 and later).
 	//cudnnDataType_t data_type = CUDNN_DATA_INT8;
 
-	// backward delta
-	CHECK_CUDNN(cudnnSetTensor4dDescriptor(l->dsrcTensorDesc, CUDNN_TENSOR_NCHW, data_type, l->batch, l->c, l->h, l->w));
-	CHECK_CUDNN(cudnnSetTensor4dDescriptor(l->ddstTensorDesc, CUDNN_TENSOR_NCHW, data_type, l->batch, l->out_c, l->out_h, l->out_w));
-	CHECK_CUDNN(cudnnSetFilter4dDescriptor(l->dweightDesc, data_type, CUDNN_TENSOR_NCHW, l->n, l->c / l->groups, l->size, l->size));
+	struct {
+		cudnnTensorDescriptor_t src;
+		cudnnTensorDescriptor_t dst;
+		cudnnFilterDescriptor_t weight;
+		cudnnTensorDescriptor_t dsrc;
+		cudnnTensorDescriptor_t ddst;
+		cudnnFilterDescriptor_t dweight;
+	} descs[] = {
+		{l->srcTensorDesc, l->dstTensorDesc, l->weightDesc, l->dsrcTensorDesc, l->ddstTensorDesc, l->dweightDesc},
+		{l->srcTensorDesc16, l->dstTensorDesc16, l->weightDesc16, l->dsrcTensorDesc16, l->ddstTensorDesc16, l->dweightDesc16}
+	};
+	cudnnDataType_t types[] = {data_type, data_type_16};
 
-	// forward
-	CHECK_CUDNN(cudnnSetTensor4dDescriptor(l->srcTensorDesc, CUDNN_TENSOR_NCHW, data_type, l->batch, l->c, l->h, l->w));
-	CHECK_CUDNN(cudnnSetTensor4dDescriptor(l->dstTensorDesc, CUDNN_TENSOR_NCHW, data_type, l->batch, l->out_c, l->out_h, l->out_w));
-	CHECK_CUDNN(cudnnSetFilter4dDescriptor(l->weightDesc, data_type, CUDNN_TENSOR_NCHW, l->n, l->c / l->groups, l->size, l->size));
-
-	// backward delta
-	CHECK_CUDNN(cudnnSetTensor4dDescriptor(l->dsrcTensorDesc16, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, l->batch, l->c, l->h, l->w));
-	CHECK_CUDNN(cudnnSetTensor4dDescriptor(l->ddstTensorDesc16, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, l->batch, l->out_c, l->out_h, l->out_w));
-	CHECK_CUDNN(cudnnSetFilter4dDescriptor(l->dweightDesc16, CUDNN_DATA_HALF, CUDNN_TENSOR_NCHW, l->n, l->c / l->groups, l->size, l->size));
-
-	// forward
-	CHECK_CUDNN(cudnnSetTensor4dDescriptor(l->srcTensorDesc16, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, l->batch, l->c, l->h, l->w));
-	CHECK_CUDNN(cudnnSetTensor4dDescriptor(l->dstTensorDesc16, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, l->batch, l->out_c, l->out_h, l->out_w));
-	CHECK_CUDNN(cudnnSetFilter4dDescriptor(l->weightDesc16, CUDNN_DATA_HALF, CUDNN_TENSOR_NCHW, l->n, l->c / l->groups, l->size, l->size));
+	for (int i = 0; i < 2; ++i)
+	{
+		CHECK_CUDNN(cudnnSetTensor4dDescriptor(descs[i].src, CUDNN_TENSOR_NCHW, types[i], l->batch, l->c, l->h, l->w));
+		CHECK_CUDNN(cudnnSetTensor4dDescriptor(descs[i].dst, CUDNN_TENSOR_NCHW, types[i], l->batch, l->out_c, l->out_h, l->out_w));
+		CHECK_CUDNN(cudnnSetFilter4dDescriptor(descs[i].weight, types[i], CUDNN_TENSOR_NCHW, l->n, l->c / l->groups, l->size, l->size));
+		CHECK_CUDNN(cudnnSetTensor4dDescriptor(descs[i].dsrc, CUDNN_TENSOR_NCHW, types[i], l->batch, l->c, l->h, l->w));
+		CHECK_CUDNN(cudnnSetTensor4dDescriptor(descs[i].ddst, CUDNN_TENSOR_NCHW, types[i], l->batch, l->out_c, l->out_h, l->out_w));
+		CHECK_CUDNN(cudnnSetFilter4dDescriptor(descs[i].dweight, types[i], CUDNN_TENSOR_NCHW, l->n, l->c / l->groups, l->size, l->size));
+	}
 
 	// batch norm
-	CHECK_CUDNN(cudnnSetTensor4dDescriptor(l->normDstTensorDescF16, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, l->batch, l->out_c, l->out_h, l->out_w));
+	CHECK_CUDNN(cudnnSetTensor4dDescriptor(l->normDstTensorDescF16, CUDNN_TENSOR_NCHW, data_type_16, l->batch, l->out_c, l->out_h, l->out_w));
 
 	// batch norm
 	CHECK_CUDNN(cudnnSetTensor4dDescriptor(l->normTensorDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, l->out_c, 1, 1));
@@ -658,18 +679,10 @@ void cudnn_convolutional_setup(Darknet::Layer *l, int cudnn_preference, size_t w
 #endif  // CUDNN_MAJOR >= 8
 
 
-	//if (data_type == CUDNN_DATA_HALF)
-	{
-		// HALF-16 if (data_type == CUDNN_DATA_HALF)
-		l->fw_algo16 = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
-		l->bd_algo16 = CUDNN_CONVOLUTION_BWD_DATA_ALGO_1;
-		l->bf_algo16 = CUDNN_CONVOLUTION_BWD_FILTER_ALGO_1;
-
-		// FLOAT-32 if (data_type == CUDNN_DATA_FLOAT)
-		//l->fw_algo16 = CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED;
-		//l->bd_algo16 = CUDNN_CONVOLUTION_BWD_DATA_ALGO_WINOGRAD_NONFUSED;
-		//l->bf_algo16 = CUDNN_CONVOLUTION_BWD_FILTER_ALGO_WINOGRAD_NONFUSED;
-	}
+	// BF16/FP16 algorithms: use IMPLICIT_PRECOMP_GEMM which is the standard tensor core algorithm.
+	l->fw_algo16 = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
+	l->bd_algo16 = CUDNN_CONVOLUTION_BWD_DATA_ALGO_1;
+	l->bf_algo16 = CUDNN_CONVOLUTION_BWD_FILTER_ALGO_1;
 }
 
 
@@ -762,9 +775,16 @@ Darknet::Layer make_convolutional_layer(int batch, int steps, int h, int w, int 
 	l.batch_normalize = batch_normalize;
 	l.learning_rate_scale = 1;
 	l.nweights = (c / groups) * n * size * size;
+	l.fp8_enabled = -1; // auto policy; may be overridden in cfg using "fp8=0/1"
+	l.fp8_format = 0;   // 0 = E4M3 (default), 1 = E5M2
+	l.fp8_weight_cache_iteration = -1;
+	l.w_scale = 1.0f;
+	l.x_scale = 1.0f;
+	l.w_amax_ema = 0.0f;
+	l.x_amax_ema = 0.0f;
 
-	if (l.share_layer)
-	{
+		if (l.share_layer)
+		{
 		if (l.size != l.share_layer->size || l.nweights != l.share_layer->nweights || l.c != l.share_layer->c || l.n != l.share_layer->n)
 		{
 			darknet_fatal_error(DARKNET_LOC, "Layer size, nweights, channels or filters don't match for the share_layer");
@@ -776,8 +796,8 @@ Darknet::Layer make_convolutional_layer(int batch, int steps, int h, int w, int 
 		l.biases = l.share_layer->biases;
 		l.bias_updates = l.share_layer->bias_updates;
 	}
-	else
-	{
+		else
+		{
 		l.weights = (float*)xcalloc(l.nweights, sizeof(float));
 		l.biases = (float*)xcalloc(n, sizeof(float));
 
@@ -936,36 +956,110 @@ Darknet::Layer make_convolutional_layer(int batch, int steps, int h, int w, int 
 			l.scale_v_gpu = cuda_make_array(l.scale_v, n);
 		}
 		if (l.share_layer)
-		{
-			l.weights_gpu = l.share_layer->weights_gpu;
-			l.weight_updates_gpu = l.share_layer->weight_updates_gpu;
-			l.weights_gpu16 = l.share_layer->weights_gpu16;
-			l.weight_updates_gpu16 = l.share_layer->weight_updates_gpu16;
-			l.biases_gpu = l.share_layer->biases_gpu;
-			l.bias_updates_gpu = l.share_layer->bias_updates_gpu;
-		}
+			{
+				l.weights_gpu = l.share_layer->weights_gpu;
+				l.weight_updates_gpu = l.share_layer->weight_updates_gpu;
+				l.weights_gpu16 = l.share_layer->weights_gpu16;
+				l.weights_conv_gpu16 = l.share_layer->weights_conv_gpu16;
+				l.weight_updates_gpu16 = l.share_layer->weight_updates_gpu16;
+				l.weight_compensation_gpu = l.share_layer->weight_compensation_gpu;
+				l.weights_fp8_gpu = l.share_layer->weights_fp8_gpu;
+				l.w_scale_gpu = l.share_layer->w_scale_gpu;
+				l.w_amax_ema_gpu = l.share_layer->w_amax_ema_gpu;
+				l.fp8_format = l.share_layer->fp8_format;
+				l.w_scale = l.share_layer->w_scale;
+				l.w_amax_ema = l.share_layer->w_amax_ema;
+				l.fp8_weight_cache_iteration = l.share_layer->fp8_weight_cache_iteration;
+				l.biases_gpu = l.share_layer->biases_gpu;
+				l.bias_updates_gpu = l.share_layer->bias_updates_gpu;
+			}
 		else
-		{
-			l.weights_gpu = cuda_make_array(l.weights, l.nweights);
-			if (train)
 			{
-				l.weight_updates_gpu = cuda_make_array(l.weight_updates, l.nweights);
-			}
+				const bool use_bf16_master_weights =
+#if defined(CUDNN_HALF) && defined(DARKNET_GPU_CUDA) && (CUDART_VERSION >= 11000)
+					cfg_and_state.use_bf16_master_weights;
+#else
+					false;
+#endif
+				float *weights_gpu_init = nullptr;
+				if (use_bf16_master_weights)
+				{
+					weights_gpu_init = cuda_make_array(l.weights, l.nweights);
+				}
+				else
+				{
+					l.weights_gpu = cuda_make_array(l.weights, l.nweights);
+					weights_gpu_init = l.weights_gpu;
+				}
+				if (train)
+				{
+					l.weight_updates_gpu = cuda_make_array(l.weight_updates, l.nweights);
+				}
 #ifdef CUDNN_HALF
-			l.weights_gpu16 = cuda_make_array(NULL, l.nweights / 2 + 1);
-			if (train)
-			{
-				l.weight_updates_gpu16 = cuda_make_array(NULL, l.nweights / 2 + 1);
-			}
+				l.weights_gpu16 = cuda_make_array(NULL, l.nweights / 2 + 1);
+#if defined(DARKNET_GPU_CUDA) && (CUDART_VERSION >= 11000)
+				if (use_bf16_master_weights)
+				{
+					cuda_convert_f32_to_bf16(weights_gpu_init, l.nweights, l.weights_gpu16);
+				}
+#endif
+#if defined(DARKNET_GPU_CUDA) && (CUDART_VERSION >= 12000)
+				if (use_bf16_master_weights && cfg_and_state.use_cudnn_fp8)
+				{
+					l.weights_conv_gpu16 = cuda_make_array(NULL, l.nweights / 2 + 1);
+				}
+#endif
+				if (train)
+				{
+					l.weight_updates_gpu16 = cuda_make_array(NULL, l.nweights / 2 + 1);
+					if (use_bf16_master_weights)
+					{
+						l.weight_compensation_gpu = cuda_make_array(NULL, l.nweights / 2 + 1);
+						CHECK_CUDA(cudaMemset(l.weight_compensation_gpu, 0, sizeof(float) * (l.nweights / 2 + 1)));
+					}
+				}
+#if defined(DARKNET_GPU_CUDA) && (CUDART_VERSION >= 12000)
+				if (cfg_and_state.use_cudnn_fp8)
+				{
+					CHECK_CUDA(cudaMalloc((void **)&l.weights_fp8_gpu, sizeof(uint8_t) * l.nweights));
+					float initial_scale = 1.0f;
+					float initial_amax = 0.0f;
+					l.w_scale_gpu = cuda_make_array(&initial_scale, 1);
+					l.w_amax_ema_gpu = cuda_make_array(&initial_amax, 1);
+				}
+#endif
 #endif  // CUDNN_HALF
-			l.biases_gpu = cuda_make_array(l.biases, n);
-			if (train)
-			{
-				l.bias_updates_gpu = cuda_make_array(l.bias_updates, n);
+				if (use_bf16_master_weights && weights_gpu_init)
+				{
+					cuda_free(weights_gpu_init);
+				}
+				l.biases_gpu = cuda_make_array(l.biases, n);
+				if (train)
+				{
+					l.bias_updates_gpu = cuda_make_array(l.bias_updates, n);
+				}
 			}
+#if defined(DARKNET_GPU_CUDA) && (CUDART_VERSION >= 12000)
+		if (cfg_and_state.use_cudnn_fp8)
+		{
+			float initial_scale = 1.0f;
+			float initial_amax = 0.0f;
+			if (!l.x_scale_gpu) l.x_scale_gpu = cuda_make_array(&initial_scale, 1);
+			if (!l.x_amax_ema_gpu) l.x_amax_ema_gpu = cuda_make_array(&initial_amax, 1);
+			if (!l.grad_scale_gpu) l.grad_scale_gpu = cuda_make_array(&initial_amax, 1);  // gradient amax scratch for backward pass
+			if (!l.grad_amax_ema_gpu) l.grad_amax_ema_gpu = cuda_make_array(&initial_amax, 1);
 		}
+#endif
 
 		l.output_gpu = cuda_make_array(l.output, total_batch*out_h*out_w*n);
+		if (cfg_and_state.use_cudnn_bf16 || cfg_and_state.use_cudnn_fp8)
+		{
+#if defined(DARKNET_GPU_CUDA) && (CUDART_VERSION >= 11000)
+			l.output_gpu16 = (float *)cuda_make_bf16_from_f32_array(NULL, total_batch*out_h*out_w*n);
+#else
+			l.output_gpu16 = nullptr;
+#endif
+		}
 		if (train)
 		{
 			l.delta_gpu = cuda_make_array(l.delta, total_batch*out_h*out_w*n);
@@ -1199,6 +1293,13 @@ void resize_convolutional_layer(Darknet::Layer *l, int w, int h)
 
 		cuda_free(l->output_gpu);
 		l->output_gpu = cuda_make_array(l->output, total_batch*l->outputs);
+		if (l->output_gpu16)
+		{
+#if defined(DARKNET_GPU_CUDA) && (CUDART_VERSION >= 11000)
+			cuda_free(l->output_gpu16);
+			l->output_gpu16 = (float *)cuda_make_bf16_from_f32_array(NULL, total_batch*l->outputs);
+#endif
+		}
 
 		if (l->batch_normalize)
 		{
@@ -1440,6 +1541,47 @@ void forward_convolutional_layer(Darknet::Layer & l, Darknet::NetworkState state
 
 	int out_h = convolutional_out_height(l);
 	int out_w = convolutional_out_width(l);
+
+#ifdef DARKNET_USE_MPS
+	if (not state.train and not l.binary and not l.xnor)
+	{
+		const Darknet::Layer *prev = mps_prev_layer(state);
+		bool defer_readback = mps_should_defer_readback(state);
+		bool activation_applied = false;
+		if (mps_convolution_forward(l, prev, state.input, l.output, defer_readback, &activation_applied, nullptr))
+		{
+			if (not activation_applied)
+			{
+				if (l.activation == SWISH) activate_array_swish(l.output, l.outputs*l.batch, l.activation_input, l.output);
+				else if (l.activation == MISH) activate_array_mish(l.output, l.outputs*l.batch, l.activation_input, l.output);
+				else if (l.activation == HARD_MISH) activate_array_hard_mish(l.output, l.outputs*l.batch, l.activation_input, l.output);
+				else if (l.activation == NORM_CHAN) activate_array_normalize_channels(l.output, l.outputs*l.batch, l.batch, l.out_c, l.out_w*l.out_h, l.output);
+				else if (l.activation == NORM_CHAN_SOFTMAX) activate_array_normalize_channels_softmax(l.output, l.outputs*l.batch, l.batch, l.out_c, l.out_w*l.out_h, l.output, 0);
+				else if (l.activation == NORM_CHAN_SOFTMAX_MAXVAL) activate_array_normalize_channels_softmax(l.output, l.outputs*l.batch, l.batch, l.out_c, l.out_w*l.out_h, l.output, 1);
+				else activate_array_cpu_custom(l.output, l.outputs*l.batch, l.activation);
+			}
+
+			if (l.assisted_excitation && state.train)
+			{
+				assisted_excitation_forward(l, state);
+			}
+
+			if (l.antialiasing)
+			{
+				Darknet::NetworkState s = { 0 };
+				s.train = state.train;
+				s.workspace = state.workspace;
+				s.net = state.net;
+				s.input = l.output;
+				forward_convolutional_layer(*(l.input_layer), s);
+				memcpy(l.output, l.input_layer->output, l.input_layer->outputs * l.input_layer->batch * sizeof(float));
+			}
+
+			return;
+		}
+		mps_flush_deferred_output(prev);
+	}
+#endif
 
 	fill_cpu(l.outputs*l.batch, 0, l.output, 1);
 

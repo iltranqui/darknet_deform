@@ -24,7 +24,12 @@ void *xrealloc_location(void *ptr, const size_t size, const char * const filenam
 int *read_map(const char *filename);
 void shuffle(void *arr, size_t n, size_t size);
 void sorta_shuffle(void *arr, size_t n, size_t size, size_t sections);
-const char * basecfg(const char * cfgfile);
+/// Extract the base filename without path or extension (e.g., "/path/to/file.cfg" -> "file")
+std::string basecfg(const std::string & cfgfile);
+
+/// @deprecated Use basecfg() returning std::string instead.
+[[deprecated("Use basecfg() returning std::string instead")]]
+const char * basecfg_cstr(const char * cfgfile);
 int alphanum_to_int(char c);
 char int_to_alphanum(int i);
 int read_int(int fd);
@@ -34,7 +39,9 @@ void write_all(int fd, char *buffer, size_t bytes);
 int read_all_fail(int fd, char *buffer, size_t bytes);
 int write_all_fail(int fd, char *buffer, size_t bytes);
 void find_replace(const char* str, char* orig, char* rep, char* output);
+std::string find_replace(const std::string & str, const std::string & orig, const std::string & rep);
 void replace_image_to_label(const char* input_path, char* output_path);
+std::string replace_image_to_label(const std::string & input_path);
 void malloc_error(const size_t size, const char * const filename, const char * const funcname, const int line);
 void calloc_error(const size_t size, const char * const filename, const char * const funcname, const int line);
 void realloc_error(const size_t size, const char * const filename, const char * const funcname, const int line);
@@ -43,7 +50,16 @@ void strip(char *s);
 void strip_args(char *s);
 void strip_char(char *s, char bad);
 list *split_str(char *s, char delim);
-char *fgetl(FILE *fp);
+
+/// Read a line from the file. Returns empty string on EOF.
+std::string fgetl(FILE *fp);
+
+/// @deprecated Use fgetl() returning std::string instead. This wrapper exists for transition.
+[[deprecated("Use fgetl() returning std::string instead")]]
+char *fgetl_cstr(FILE *fp);
+
+/// @deprecated Use std::string copy assignment instead.
+[[deprecated("Use std::string instead of copy_string()")]]
 char *copy_string(char *s);
 void normalize_array(float *a, int n);
 void scale_array(float *a, int n, float s);

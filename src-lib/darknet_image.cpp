@@ -676,13 +676,11 @@ void Darknet::show_image_layers(const Darknet::Image & p, const char * name)
 {
 	TAT(TATPARMS);
 
-	int i;
-	char buff[256];
-	for (i = 0; i < p.c; ++i)
+	for (int i = 0; i < p.c; ++i)
 	{
-		sprintf(buff, "%s - Layer %d", name, i);
+		const std::string caption = std::string(name ? name : "") + " - Layer " + std::to_string(i);
 		Darknet::Image layer = get_image_layer(p, i);
-		Darknet::show_image(layer, buff);
+		Darknet::show_image(layer, caption.c_str());
 		Darknet::free_image(layer);
 	}
 }

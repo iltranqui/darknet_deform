@@ -36,4 +36,28 @@ namespace Darknet
 	 * @since 2025-12-06
 	 */
 	std::uint16_t convert_to_fp16(const float f);
+
+	/** Generic RAII deleter for C resources.
+	 * Zero-overhead wrapper using compile-time function pointer.
+	 * @tparam DestroyFn The cleanup function (e.g., free, fclose)
+	 * @since 2026-01-18
+	 */
+	template <auto DestroyFn>
+	struct ResourceDeleter
+	{
+		template <typename T>
+		void operator()(T* pointer) const noexcept
+		{
+			if (pointer)
+			{
+				DestroyFn(pointer);
+			}
+		}
+	};
+
+	/// RAII wrapper for C strings allocated with malloc/xmalloc (auto-freed)
+	using CStringPtr = std::unique_ptr<char, ResourceDeleter<free>>;
+
+	/// RAII wrapper for FILE* handles (auto-closed)
+	using FilePtr = std::unique_ptr<FILE, ResourceDeleter<fclose>>;
 }
